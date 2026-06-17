@@ -133,7 +133,7 @@ pub async fn get_status(options: Options) -> UpdateStatus {
                 status_from_state(&state, &options.current_version, &install_type, &command);
             status.source = "live".to_string();
             status
-        }
+        },
         Err(_) => {
             if let Some(mut state) = cached {
                 state.last_check_failed_at = Some(Utc::now());
@@ -146,7 +146,7 @@ pub async fn get_status(options: Options) -> UpdateStatus {
             } else {
                 status
             }
-        }
+        },
     }
 }
 
