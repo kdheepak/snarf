@@ -1134,6 +1134,7 @@ fn isolated_root() -> PathBuf {
     root
 }
 
+#[cfg(unix)]
 fn wait_for_flag(flag: &AtomicBool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -1145,6 +1146,7 @@ fn wait_for_flag(flag: &AtomicBool) -> bool {
     false
 }
 
+#[cfg(unix)]
 fn wait_for_crawl_status(
     root: &Path,
     crawl_id: &str,
