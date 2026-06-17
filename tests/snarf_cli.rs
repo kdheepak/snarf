@@ -583,36 +583,6 @@ fn cached_rewrite_aliases_are_relabelled_for_current_request() {
 }
 
 #[test]
-fn docs_invalid_backend_exits_validation() {
-    let output = snarf_command()
-        .args(["docs", "anything", "--backend", "missing"])
-        .output()
-        .expect("snarf runs");
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("invalid value 'missing'"),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-fn docs_context7_without_api_key_exits_precondition() {
-    let output = snarf_command()
-        .args(["docs", "anything", "--backend", "context7"])
-        .output()
-        .expect("snarf runs");
-
-    assert_eq!(output.status.code(), Some(5));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("context7: API key not set"),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
 fn search_brave_without_api_key_exits_precondition() {
     let output = snarf_command()
         .args(["search", "anything", "--backend", "brave"])

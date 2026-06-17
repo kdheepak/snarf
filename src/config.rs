@@ -76,12 +76,6 @@ backend_enum! {
     }
 }
 
-backend_enum! {
-    pub enum DocsBackend {
-        Context7 => "context7",
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -96,9 +90,6 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub browser: String,
     pub code_backend: CodeBackend,
-    pub docs_backend: DocsBackend,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub context7_api_key: String,
     pub sourcegraph_url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub github_token: String,
@@ -116,9 +107,7 @@ impl Default for AppConfig {
             limit: 5,
             cache_ttl: "72h".to_string(),
             browser: String::new(),
-            code_backend: CodeBackend::Grepapp,
-            docs_backend: DocsBackend::Context7,
-            context7_api_key: String::new(),
+            code_backend: CodeBackend::Github,
             sourcegraph_url: "https://sourcegraph.com".to_string(),
             github_token: String::new(),
             url_rewrites: Vec::new(),
@@ -233,10 +222,6 @@ pub fn available_code_backends() -> Vec<&'static str> {
     CodeBackend::values()
 }
 
-pub fn available_doc_backends() -> Vec<&'static str> {
-    DocsBackend::values()
-}
-
 pub fn parse_duration(value: &str) -> eyre::Result<Duration> {
     let value = value.trim();
     if value.is_empty() {
@@ -322,9 +307,7 @@ mod tests {
 
     use crate::urlrewrite::Rule;
 
-    use super::{
-        AppConfig, CodeBackend, DocsBackend, SearchBackend, github_token_from_gh, parse_duration,
-    };
+    use super::{AppConfig, CodeBackend, SearchBackend, github_token_from_gh, parse_duration};
 
     static NEXT_CONFIG_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -416,8 +399,7 @@ mod tests {
         assert_eq!(decoded.searxng_url, "http://localhost:8081");
         assert_eq!(decoded.limit, 5);
         assert_eq!(decoded.cache_ttl, "72h");
-        assert_eq!(decoded.code_backend, CodeBackend::Grepapp);
-        assert_eq!(decoded.docs_backend, DocsBackend::Context7);
+        assert_eq!(decoded.code_backend, CodeBackend::Github);
         assert_eq!(decoded.sourcegraph_url, "https://sourcegraph.com");
     }
 

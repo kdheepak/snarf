@@ -2,7 +2,6 @@ mod cache;
 mod code_search;
 mod config;
 mod crawl;
-mod docs;
 mod error;
 mod extract;
 mod headers;
@@ -29,11 +28,11 @@ use std::os::unix::process::CommandExt;
 
 use crate::cache::PageCache;
 use crate::code_search::CodeQuery;
-use crate::config::{AppConfig, CodeBackend, DocsBackend, SearchBackend};
+use crate::config::{AppConfig, CodeBackend, SearchBackend};
 use crate::crawl::CrawlOptions;
 use crate::error::{AppError, AppResult};
 use crate::scrape::Scraper;
-use crate::types::{CodeResult, DocsResult, Page, SearchResult};
+use crate::types::{CodeResult, Page, SearchResult};
 
 const EXIT_VALIDATION: u8 = 2;
 const EXIT_NOT_FOUND: u8 = 3;
@@ -107,7 +106,7 @@ impl From<AppError> for CliError {
     name = "snarf",
     version,
     about = "Fast web search and scrape for workflows",
-    long_about = "snarf is a fast CLI for search and scrape workflows. Search the web, search code, search docs, scrape pages to clean markdown, or crawl a site."
+    long_about = "snarf is a fast CLI for search and scrape workflows. Search the web, search code, scrape pages to clean markdown, or crawl a site."
 )]
 struct Cli {
     #[arg(long, global = true, help = "output as JSON")]
@@ -123,8 +122,6 @@ enum Command {
     Search(SearchArgs),
     #[command(about = "Search code across open-source repositories")]
     Code(CodeArgs),
-    #[command(about = "Search library documentation")]
-    Docs(DocsArgs),
     #[command(about = "Scrape URLs and extract clean markdown")]
     Scrape(ScrapeArgs),
     #[command(about = "Crawl a site and extract pages")]
@@ -179,31 +176,6 @@ struct CodeArgs {
     #[arg(short = 'l', long, help = "max number of results")]
     limit: Option<usize>,
     #[arg(long, help = "one result per line, tab-separated (url/repo/snippet)")]
-    minimal: bool,
-}
-
-#[derive(Args, Debug)]
-struct DocsArgs {
-    #[arg(required = true, help = "documentation query")]
-    query: Vec<String>,
-    #[arg(short = 'b', long, value_enum, help = "docs backend")]
-    backend: Option<DocsBackend>,
-    #[arg(
-        long,
-        default_value = "",
-        help = "Context7 library ID (skip resolve step)"
-    )]
-    library: String,
-    #[arg(long, default_value_t = 4000, help = "Context7 token budget")]
-    tokens: usize,
-    #[arg(short = 'l', long, help = "max number of results")]
-    limit: Option<usize>,
-    #[arg(long, help = "resolve library name instead of searching")]
-    resolve: bool,
-    #[arg(
-        long,
-        help = "one result per line, tab-separated (url/library/snippet)"
-    )]
     minimal: bool,
 }
 
@@ -337,14 +309,12 @@ struct ConfigInfo {
     #[serde(skip_serializing_if = "String::is_empty")]
     browser: String,
     code_backend: CodeBackend,
-    docs_backend: DocsBackend,
     sourcegraph_url: String,
     github_token_source: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     url_rewrites: Vec<urlrewrite::Rule>,
     available_backends: Vec<&'static str>,
     available_code_backends: Vec<&'static str>,
-    available_doc_backends: Vec<&'static str>,
 }
 
 #[tokio::main]
@@ -435,7 +405,6 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     let result = match cli.command {
         Some(Command::Search(args)) => run_search(as_json, &cfg, args).await,
         Some(Command::Code(args)) => run_code(as_json, &cfg, args).await,
-        Some(Command::Docs(args)) => run_docs(as_json, &cfg, args).await,
         Some(Command::Scrape(args)) => run_scrape(as_json, &cfg, args).await,
         Some(Command::Crawl(args)) => run_crawl(as_json, &cfg, args).await,
         Some(Command::Browser(args)) => run_browser(as_json, &cfg, args).await,
@@ -504,7 +473,6 @@ fn command_name(command: &Option<Command>) -> Option<&'static str> {
     Some(match command {
         Some(Command::Search(_)) => "search",
         Some(Command::Code(_)) => "code",
-        Some(Command::Docs(_)) => "docs",
         Some(Command::Scrape(_)) => "scrape",
         Some(Command::Crawl(_)) => "crawl",
         Some(Command::Browser(_)) => "browser",
@@ -516,11 +484,10 @@ fn command_name(command: &Option<Command>) -> Option<&'static str> {
 }
 
 fn print_root(cfg: &AppConfig) {
-    println!("snarf - web search, code search, docs, and scrape in one binary.\n");
+    println!("snarf - web search, code search, scrape, and crawl in one binary.\n");
     println!("Commands:");
     println!("  search      Search the web and return results");
     println!("  code        Search code across open-source repositories");
-    println!("  docs        Search library documentation");
     println!("  scrape      Scrape URLs and extract clean markdown");
     println!("  crawl       Crawl a site and extract pages");
     println!("  browser     Manage browser for JS-rendered page support");
@@ -535,10 +502,6 @@ fn print_root(cfg: &AppConfig) {
     println!(
         "  code        {}",
         join_with_default(&config::available_code_backends(), cfg.code_backend)
-    );
-    println!(
-        "  docs        {}",
-        join_with_default(&config::available_doc_backends(), cfg.docs_backend)
     );
     println!("\nRun 'snarf <command> --help' for flags and examples.");
 }
@@ -735,95 +698,6 @@ fn code_result_header(result: &CodeResult) -> String {
         header.push_str(&format!("  \u{2605} {}", result.stars));
     }
     header
-}
-
-async fn run_docs(as_json: bool, cfg: &AppConfig, args: DocsArgs) -> Result<(), CliError> {
-    let query = args.query.join(" ");
-    let backend = args.backend.unwrap_or(cfg.docs_backend);
-    let limit = args.limit.unwrap_or(cfg.limit);
-
-    if args.resolve {
-        let matches = docs::resolve(&query, &cfg.context7_api_key)
-            .await
-            .map_err(|err| CliError::from(err.with_upstream_context("resolve failed")))?;
-        if as_json {
-            print_json(&matches)?;
-        } else {
-            for item in matches {
-                println!(
-                    "{}  {}  (snippets: {}, trust: {:.1})",
-                    item.id, item.title, item.total_snippets, item.trust_score
-                );
-            }
-        }
-        return Ok(());
-    }
-
-    let results = if !args.library.is_empty() && backend == DocsBackend::Context7 {
-        docs::docs_for_library(&query, &args.library, args.tokens, &cfg.context7_api_key)
-            .await
-            .map_err(|err| CliError::from(err.with_upstream_context("docs fetch failed")))?
-    } else {
-        docs::search(backend, &query, limit, &cfg.context7_api_key)
-            .await
-            .map_err(|err| CliError::from(err.with_upstream_context("docs search failed")))?
-    };
-    let results = limit_docs_results(results, limit);
-
-    if as_json {
-        print_json(&results)?;
-    } else {
-        print_docs_results(&query, backend, &args.library, &results, args.minimal);
-    }
-    Ok(())
-}
-
-fn print_docs_results(
-    query: &str,
-    backend: DocsBackend,
-    library: &str,
-    results: &[DocsResult],
-    minimal: bool,
-) {
-    if minimal {
-        for result in results {
-            println!(
-                "{}\t{}\t{}",
-                result.url,
-                result.library,
-                first_line(&result.snippet)
-            );
-        }
-        return;
-    }
-
-    println!("---");
-    println!("query: {query}");
-    println!("backend: {backend}");
-    if !library.is_empty() {
-        println!("library: {library}");
-    } else if let Some(first) = results.first()
-        && !first.library.is_empty()
-    {
-        println!("library: {}", first.library);
-    }
-    println!("result_count: {}", results.len());
-    println!("---");
-    for result in results {
-        let label = if result.breadcrumb.is_empty() {
-            &result.title
-        } else {
-            &result.breadcrumb
-        };
-        println!("[{label}]");
-        println!("  {}", result.snippet);
-        println!("  source: {}\n", result.url);
-    }
-}
-
-fn limit_docs_results(mut results: Vec<DocsResult>, limit: usize) -> Vec<DocsResult> {
-    results.truncate(limit);
-    results
 }
 
 async fn run_scrape(as_json: bool, cfg: &AppConfig, args: ScrapeArgs) -> Result<(), CliError> {
@@ -1503,13 +1377,11 @@ async fn run_config(as_json: bool, cfg: &AppConfig, args: ConfigArgs) -> Result<
                 cache_ttl: cfg.cache_ttl.clone(),
                 browser: cfg.browser.clone(),
                 code_backend: cfg.code_backend,
-                docs_backend: cfg.docs_backend,
                 sourcegraph_url: cfg.sourcegraph_url.clone(),
                 github_token_source: gh_source,
                 url_rewrites: cfg.url_rewrites.clone(),
                 available_backends: config::available_backends(),
                 available_code_backends: config::available_code_backends(),
-                available_doc_backends: config::available_doc_backends(),
             };
             if as_json {
                 print_json(&info)?;
@@ -1590,10 +1462,6 @@ fn apply_config_set(cfg: &mut AppConfig, key: &str, value: &str) -> Result<(), C
         "code_backend" => {
             cfg.code_backend = CodeBackend::parse(value).map_err(CliError::validation)?;
         }
-        "docs_backend" => {
-            cfg.docs_backend = DocsBackend::parse(value).map_err(CliError::validation)?;
-        }
-        "context7_api_key" => cfg.context7_api_key = value.to_string(),
         "sourcegraph_url" => cfg.sourcegraph_url = value.to_string(),
         "github_token" => cfg.github_token = value.to_string(),
         "url_rewrites" => {
@@ -1608,7 +1476,7 @@ fn apply_config_set(cfg: &mut AppConfig, key: &str, value: &str) -> Result<(), C
         }
         _ => {
             return Err(CliError::validation(format!(
-                "unknown key: {key} (valid: backend, searxng_url, brave_api_key, exa_api_key, limit, cache_ttl, browser, code_backend, docs_backend, context7_api_key, sourcegraph_url, github_token, url_rewrites)"
+                "unknown key: {key} (valid: backend, searxng_url, brave_api_key, exa_api_key, limit, cache_ttl, browser, code_backend, sourcegraph_url, github_token, url_rewrites)"
             )));
         }
     }
@@ -1862,12 +1730,9 @@ fn print_json_pretty<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
 mod tests {
     use crate::config::AppConfig;
     use crate::crawl::CrawlStatus;
-    use crate::types::{CodeResult, DocsResult};
+    use crate::types::CodeResult;
 
-    use super::{
-        apply_config_set, code_result_header, limit_docs_results, mark_crawl_status_failed,
-        rust_version,
-    };
+    use super::{apply_config_set, code_result_header, mark_crawl_status_failed, rust_version};
     use clap::Parser;
 
     #[test]
@@ -1933,7 +1798,7 @@ mod tests {
     fn config_set_rejects_invalid_backends() {
         let mut config = AppConfig::default();
 
-        for key in ["backend", "code_backend", "docs_backend"] {
+        for key in ["backend", "code_backend"] {
             let error = apply_config_set(&mut config, key, "missing").unwrap_err();
 
             assert!(
@@ -1980,26 +1845,6 @@ mod tests {
             code_result_header(&result),
             "owner/repo  src/lib.rs  (line 42)  \u{2605} 123"
         );
-    }
-
-    #[test]
-    fn docs_limit_applies_after_direct_library_fetch() {
-        let results = limit_docs_results(
-            vec![
-                DocsResult {
-                    title: "first".to_string(),
-                    ..DocsResult::default()
-                },
-                DocsResult {
-                    title: "second".to_string(),
-                    ..DocsResult::default()
-                },
-            ],
-            1,
-        );
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].title, "first");
     }
 
     #[test]
