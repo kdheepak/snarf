@@ -268,7 +268,7 @@ async fn process_item(
                     ..CrawlResult::default()
                 }),
             }
-        },
+        }
         Err(err) => ProcessedItem {
             depth: item.depth,
             links: Vec::new(),
@@ -468,17 +468,17 @@ pub async fn fetch_sitemap(sitemap_url: &str) -> eyre::Result<Vec<String>> {
                     Err(err) => {
                         failures.push(format!("{candidate}: failed to read response body: {err}"));
                         continue;
-                    },
+                    }
                 },
                 Err(err) => {
                     failures.push(format!("{candidate}: {err}"));
                     continue;
-                },
+                }
             },
             Err(err) => {
                 failures.push(format!("{candidate}: {err}"));
                 continue;
-            },
+            }
         };
 
         match parse_sitemap(&body, &client).await {
@@ -579,7 +579,7 @@ async fn parse_sitemap(xml: &str, client: &reqwest::Client) -> eyre::Result<Vec<
                 }
             }
             Ok(urls)
-        },
+        }
         Some(root) if root == "urlset" => {
             let url_set: UrlSet = quick_xml::de::from_str(xml)
                 .map_err(|err| eyre::eyre!("failed to parse sitemap XML: {err}"))?;
@@ -591,10 +591,10 @@ async fn parse_sitemap(xml: &str, client: &reqwest::Client) -> eyre::Result<Vec<
                     if loc.is_empty() { None } else { Some(loc) }
                 })
                 .collect())
-        },
+        }
         Some(root) => {
             eyre::bail!("expected sitemap XML root <urlset> or <sitemapindex>, found <{root}>")
-        },
+        }
         None => eyre::bail!("empty sitemap XML document"),
     }
 }
@@ -609,9 +609,9 @@ fn first_xml_element(xml: &str) -> eyre::Result<Option<String>> {
             | Ok(quick_xml::events::Event::Empty(element)) => {
                 let name = element.name();
                 return Ok(Some(String::from_utf8_lossy(name.as_ref()).into_owned()));
-            },
+            }
             Ok(quick_xml::events::Event::Eof) => return Ok(None),
-            Ok(_) => {},
+            Ok(_) => {}
             Err(err) => return Err(eyre::eyre!("failed to parse sitemap XML: {err}")),
         }
     }
