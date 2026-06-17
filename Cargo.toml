@@ -1,6 +1,10 @@
 [package]
 name = "snarf"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.1.2"
+>>>>>>> Stashed changes
 edition = "2024"
 default-run = "snarf"
 description = "Fast CLI for web searching."
