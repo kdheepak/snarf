@@ -875,6 +875,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetches_default_sitemap_from_site_root() {
+        let server = TestHttpServer::routes(HashMap::from([(
+            "/sitemap.xml".to_string(),
+            r#"<urlset><url><loc>https://example.com/from-root</loc></url></urlset>"#.to_string(),
+        )]));
+
+        let urls = fetch_sitemap(&server.url).await.unwrap();
+        assert_eq!(urls, vec!["https://example.com/from-root".to_string()]);
+        assert_eq!(server.paths(), vec!["/robots.txt", "/sitemap.xml"]);
+    }
+
+    #[tokio::test]
+    async fn fetches_robots_sitemap_locations() {
+        let server = TestHttpServer::routes(HashMap::from([
+            (
+                "/robots.txt".to_string(),
+                "User-agent: *\nSitemap: SERVER/custom-sitemap.xml # primary sitemap\n".to_string(),
+            ),
+            (
+                "/custom-sitemap.xml".to_string(),
+                r#"<urlset><url><loc>https://example.com/from-robots</loc></url></urlset>"#
+                    .to_string(),
+            ),
+        ]));
+        server.replace_route_token("SERVER");
+
+        let urls = fetch_sitemap(&server.url).await.unwrap();
+        assert_eq!(urls, vec!["https://example.com/from-robots".to_string()]);
+        assert_eq!(server.paths(), vec!["/robots.txt", "/custom-sitemap.xml"]);
+    }
+
+    #[tokio::test]
     async fn fetches_sitemap_indexes() {
         let server = TestHttpServer::routes_with_root_fallback(HashMap::from([
             (
@@ -892,6 +924,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(urls, vec!["https://example.com/from-index".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn fetches_sitemap_index_from_site_root() {
+        let server = TestHttpServer::routes(HashMap::from([
+            (
+                "/sitemap-index.xml".to_string(),
+                r#"<sitemapindex><sitemap><loc>SERVER/sitemap-0.xml</loc></sitemap></sitemapindex>"#.to_string(),
+            ),
+            (
+                "/sitemap-0.xml".to_string(),
+                r#"<urlset><url><loc>https://example.com/from-index-root</loc></url></urlset>"#
+                    .to_string(),
+            ),
+        ]));
+        server.replace_route_token("SERVER");
+
+        let urls = fetch_sitemap(&server.url).await.unwrap();
+        assert_eq!(
+            urls,
+            vec!["https://example.com/from-index-root".to_string()]
+        );
+        assert_eq!(
+            server.paths(),
+            vec![
+                "/robots.txt",
+                "/sitemap.xml",
+                "/sitemap-index.xml",
+                "/sitemap-0.xml",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_html_documents_as_non_sitemaps() {
+        let server = TestHttpServer::routes_with_root_fallback(HashMap::from([(
+            "/".to_string(),
+            r#"<!doctype html><html><head><style>@media(min-width:32.5rem){.rail[data-astro-cid-rff6ndou]}</style></head><body></body></html>"#
+                .to_string(),
+        )]));
+
+        let err = fetch_sitemap(&server.url).await.unwrap_err().to_string();
+        assert!(err.contains("expected sitemap XML root <urlset> or <sitemapindex>"));
+        assert!(err.contains("found <html>"));
     }
 
     #[tokio::test]
