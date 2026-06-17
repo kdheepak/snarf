@@ -1,45 +1,46 @@
-use std::time::Duration;
-
 use color_eyre::eyre;
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 
+use crate::config::DocsBackend;
+use crate::error::{AppError, AppResult};
+use crate::http;
 use crate::types::{DocsResult, LibraryMatch};
 
 pub async fn search(
-    backend: &str,
+    backend: DocsBackend,
     query: &str,
     limit: usize,
     context7_api_key: &str,
-) -> eyre::Result<Vec<DocsResult>> {
+) -> AppResult<Vec<DocsResult>> {
     match backend {
-        "context7" => {
+        DocsBackend::Context7 => {
             if context7_api_key.is_empty() {
-                eyre::bail!(
-                    "context7: API key not set (get one then: snarf config set context7_api_key <key>)"
-                );
+                return Err(AppError::precondition(
+                    "context7: API key not set (get one then: snarf config set context7_api_key <key>)",
+                ));
             }
-            let client = client()?;
+            let client = http::client(http::FETCH_TIMEOUT)?;
             let libs = resolve_library(&client, query, context7_api_key).await?;
             let Some(library) = libs.first() else {
-                eyre::bail!("context7: no library found for {query:?}");
+                return Err(AppError::upstream(format!(
+                    "context7: no library found for {query:?}"
+                )));
             };
             let mut results = get_docs(&client, &library.id, query, 4000, context7_api_key).await?;
             results.truncate(limit);
             Ok(results)
         }
-        "local" => eyre::bail!("local fts5 backend not yet implemented"),
-        _ => eyre::bail!("unknown docs backend: {backend}"),
     }
 }
 
-pub async fn resolve(query: &str, context7_api_key: &str) -> eyre::Result<Vec<LibraryMatch>> {
+pub async fn resolve(query: &str, context7_api_key: &str) -> AppResult<Vec<LibraryMatch>> {
     if context7_api_key.is_empty() {
-        eyre::bail!(
-            "context7: API key not set (get one then: snarf config set context7_api_key <key>)"
-        );
+        return Err(AppError::precondition(
+            "context7: API key not set (get one then: snarf config set context7_api_key <key>)",
+        ));
     }
-    resolve_library(&client()?, query, context7_api_key).await
+    Ok(resolve_library(&http::client(http::FETCH_TIMEOUT)?, query, context7_api_key).await?)
 }
 
 pub async fn docs_for_library(
@@ -47,20 +48,20 @@ pub async fn docs_for_library(
     library_id: &str,
     tokens: usize,
     context7_api_key: &str,
-) -> eyre::Result<Vec<DocsResult>> {
+) -> AppResult<Vec<DocsResult>> {
     if context7_api_key.is_empty() {
-        eyre::bail!(
-            "context7: API key not set (get one then: snarf config set context7_api_key <key>)"
-        );
+        return Err(AppError::precondition(
+            "context7: API key not set (get one then: snarf config set context7_api_key <key>)",
+        ));
     }
-    get_docs(&client()?, library_id, query, tokens, context7_api_key).await
-}
-
-fn client() -> eyre::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (compatible; snarf/1.0)")
-        .build()?)
+    Ok(get_docs(
+        &http::client(http::FETCH_TIMEOUT)?,
+        library_id,
+        query,
+        tokens,
+        context7_api_key,
+    )
+    .await?)
 }
 
 async fn resolve_library(

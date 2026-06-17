@@ -3,9 +3,15 @@ mod code_search;
 mod config;
 mod crawl;
 mod docs;
+mod error;
 mod extract;
+mod fs_atomic;
+mod headers;
+mod http;
 mod scrape;
 mod search;
+#[cfg(test)]
+mod testserver;
 mod types;
 mod updatecheck;
 mod urlrewrite;
@@ -13,19 +19,20 @@ mod urlrewrite;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use color_eyre::eyre;
+use futures_util::StreamExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 use crate::cache::PageCache;
 use crate::code_search::CodeQuery;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, CodeBackend, DocsBackend, SearchBackend};
 use crate::crawl::CrawlOptions;
+use crate::error::{AppError, AppResult};
 use crate::scrape::Scraper;
 use crate::types::{CodeResult, DocsResult, Page, SearchResult};
 
@@ -84,12 +91,24 @@ impl From<eyre::Report> for CliError {
     }
 }
 
+impl From<AppError> for CliError {
+    fn from(error: AppError) -> Self {
+        match error {
+            AppError::Validation(message) => Self::validation(message),
+            AppError::NotFound(message) => Self::not_found(message),
+            AppError::Upstream(message) => Self::upstream(message),
+            AppError::Precondition(message) => Self::precondition(message),
+            AppError::RegexUnsupported => Self::precondition("backend does not support --regex"),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "snarf",
     version,
-    about = "Fast web search and scrape for agents",
-    long_about = "snarf is a fast CLI for agentic search and scrape workflows. Search the web, search code, search docs, scrape pages to clean markdown, or crawl a site."
+    about = "Fast web search and scrape for workflows",
+    long_about = "snarf is a fast CLI for search and scrape workflows. Search the web, search code, search docs, scrape pages to clean markdown, or crawl a site."
 )]
 struct Cli {
     #[arg(long, global = true, help = "output as JSON")]
@@ -125,8 +144,8 @@ enum Command {
 struct SearchArgs {
     #[arg(required = true, help = "search query")]
     query: Vec<String>,
-    #[arg(short = 'b', long, help = "search backend: brave, ddg, searxng, exa")]
-    backend: Option<String>,
+    #[arg(short = 'b', long, value_enum, help = "search backend")]
+    backend: Option<SearchBackend>,
     #[arg(short = 'l', long, help = "max number of results")]
     limit: Option<usize>,
     #[arg(long, help = "scrape full content from each result")]
@@ -149,12 +168,8 @@ struct SearchArgs {
 struct CodeArgs {
     #[arg(required = true, help = "code search query")]
     query: Vec<String>,
-    #[arg(
-        short = 'b',
-        long,
-        help = "code search backend: grepapp, sourcegraph, github"
-    )]
-    backend: Option<String>,
+    #[arg(short = 'b', long, value_enum, help = "code search backend")]
+    backend: Option<CodeBackend>,
     #[arg(long, default_value = "", help = "language filter (appended to query)")]
     lang: String,
     #[arg(
@@ -172,8 +187,8 @@ struct CodeArgs {
 struct DocsArgs {
     #[arg(required = true, help = "documentation query")]
     query: Vec<String>,
-    #[arg(short = 'b', long, help = "docs backend: context7, local")]
-    backend: Option<String>,
+    #[arg(short = 'b', long, value_enum, help = "docs backend")]
+    backend: Option<DocsBackend>,
     #[arg(
         long,
         default_value = "",
@@ -316,21 +331,21 @@ enum CacheCommand {
 #[derive(serde::Serialize)]
 struct ConfigInfo {
     config_path: std::path::PathBuf,
-    backend: String,
+    backend: SearchBackend,
     searxng_url: String,
     limit: usize,
     cache_ttl: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     browser: String,
-    code_backend: String,
-    docs_backend: String,
+    code_backend: CodeBackend,
+    docs_backend: DocsBackend,
     sourcegraph_url: String,
     github_token_source: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     url_rewrites: Vec<urlrewrite::Rule>,
-    available_backends: [&'static str; 4],
-    available_code_backends: [&'static str; 3],
-    available_doc_backends: [&'static str; 2],
+    available_backends: Vec<&'static str>,
+    available_code_backends: Vec<&'static str>,
+    available_doc_backends: Vec<&'static str>,
 }
 
 #[tokio::main]
@@ -350,13 +365,32 @@ async fn main() -> ExitCode {
 }
 
 async fn run_until_signal() -> Result<(), CliError> {
+    let cli = Cli::parse();
+    if handles_shutdown_signal_in_command(&cli) {
+        return run(cli).await;
+    }
+
     tokio::select! {
-        result = run() => result,
+        result = run(cli) => result,
         signal = shutdown_signal() => {
             mark_background_worker_stopped_on_cancel();
             Err(CliError::cancelled(format!("cancelled by {signal}")))
         }
     }
+}
+
+fn handles_shutdown_signal_in_command(cli: &Cli) -> bool {
+    if std::env::var_os("SNARF_CRAWL_WORKER").is_some() {
+        return true;
+    }
+    matches!(
+        &cli.command,
+        Some(Command::Crawl(CrawlArgs {
+            command: None,
+            background: false,
+            ..
+        }))
+    )
 }
 
 async fn shutdown_signal() -> &'static str {
@@ -394,8 +428,7 @@ fn mark_background_worker_stopped_on_cancel() {
     let _ = crawl::write_status(&mut status);
 }
 
-async fn run() -> Result<(), CliError> {
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> Result<(), CliError> {
     let cfg = AppConfig::load();
     let as_json = cli.json;
     let passive_update = prepare_passive_update_notice(&cli, as_json).await;
@@ -498,24 +531,25 @@ fn print_root(cfg: &AppConfig) {
     println!("\nBackends:");
     println!(
         "  search      {}",
-        join_with_default(&config::available_backends(), &cfg.backend)
+        join_with_default(&config::available_backends(), cfg.backend)
     );
     println!(
         "  code        {}",
-        join_with_default(&config::available_code_backends(), &cfg.code_backend)
+        join_with_default(&config::available_code_backends(), cfg.code_backend)
     );
     println!(
         "  docs        {}",
-        join_with_default(&config::available_doc_backends(), &cfg.docs_backend)
+        join_with_default(&config::available_doc_backends(), cfg.docs_backend)
     );
     println!("\nRun 'snarf <command> --help' for flags and examples.");
 }
 
-fn join_with_default(backends: &[&str], active: &str) -> String {
+fn join_with_default(backends: &[&str], active: impl std::fmt::Display) -> String {
+    let active = active.to_string();
     backends
         .iter()
         .map(|backend| {
-            if *backend == active {
+            if *backend == active.as_str() {
                 format!("{backend} (default)")
             } else {
                 (*backend).to_string()
@@ -527,11 +561,11 @@ fn join_with_default(backends: &[&str], active: &str) -> String {
 
 async fn run_search(as_json: bool, cfg: &AppConfig, args: SearchArgs) -> Result<(), CliError> {
     let query = args.query.join(" ");
-    let backend = args.backend.unwrap_or_else(|| cfg.backend.clone());
+    let backend = args.backend.unwrap_or(cfg.backend);
     let limit = args.limit.unwrap_or(cfg.limit);
     let searxng_url = args.searxng_url.unwrap_or_else(|| cfg.searxng_url.clone());
     let results = search::search(
-        &backend,
+        backend,
         &query,
         limit,
         &searxng_url,
@@ -539,7 +573,7 @@ async fn run_search(as_json: bool, cfg: &AppConfig, args: SearchArgs) -> Result<
         &cfg.exa_api_key,
     )
     .await
-    .map_err(|err| classify_backend_error(err, "search failed"))?;
+    .map_err(|err| CliError::from(err.with_upstream_context("search failed")))?;
 
     if args.scrape {
         return run_search_scrape(
@@ -627,17 +661,22 @@ async fn run_search_scrape(
 
 async fn run_code(as_json: bool, cfg: &AppConfig, args: CodeArgs) -> Result<(), CliError> {
     let query = args.query.join(" ");
-    let backend = args.backend.unwrap_or_else(|| cfg.code_backend.clone());
+    let backend = args.backend.unwrap_or(cfg.code_backend);
     let limit = args.limit.unwrap_or(cfg.limit);
-    let (token, _) = cfg.resolve_github_token();
-    if backend == "github" && token.is_empty() {
-        return Err(CliError::precondition(
-            "github code search: no token found.\n  - explicit:   snarf config set github_token <token>\n  - env var:    export GITHUB_TOKEN=<token>\n  - or run:     gh auth login",
-        ));
-    }
+    let token = if backend == CodeBackend::Github {
+        let (token, _) = cfg.resolve_github_token();
+        if token.is_empty() {
+            return Err(CliError::precondition(
+                "github code search: no token found.\n  - explicit:   snarf config set github_token <token>\n  - env var:    export GITHUB_TOKEN=<token>\n  - or run:     gh auth login",
+            ));
+        }
+        token
+    } else {
+        String::new()
+    };
 
     let results = code_search::search(
-        &backend,
+        backend,
         CodeQuery {
             term: query.clone(),
             lang: args.lang.clone(),
@@ -649,16 +688,12 @@ async fn run_code(as_json: bool, cfg: &AppConfig, args: CodeArgs) -> Result<(), 
     )
     .await
     .map_err(|err| {
-        let message = err.to_string();
-        if message == "REGEX_UNSUPPORTED" {
-            CliError::precondition(format!(
-                "backend {backend:?} does not support --regex (try -b grepapp or -b sourcegraph)"
-            ))
-        } else if message.starts_with("unknown ") {
-            CliError::validation(message)
-        } else {
-            CliError::upstream(format!("code search failed: {message}"))
+        if matches!(err, AppError::RegexUnsupported) {
+            return CliError::precondition(format!(
+                "backend {backend} does not support --regex (try -b grepapp or -b sourcegraph)"
+            ));
         }
+        CliError::from(err.with_upstream_context("code search failed"))
     })?;
 
     if as_json {
@@ -705,13 +740,13 @@ fn code_result_header(result: &CodeResult) -> String {
 
 async fn run_docs(as_json: bool, cfg: &AppConfig, args: DocsArgs) -> Result<(), CliError> {
     let query = args.query.join(" ");
-    let backend = args.backend.unwrap_or_else(|| cfg.docs_backend.clone());
+    let backend = args.backend.unwrap_or(cfg.docs_backend);
     let limit = args.limit.unwrap_or(cfg.limit);
 
     if args.resolve {
         let matches = docs::resolve(&query, &cfg.context7_api_key)
             .await
-            .map_err(|err| classify_backend_error(err, "resolve failed"))?;
+            .map_err(|err| CliError::from(err.with_upstream_context("resolve failed")))?;
         if as_json {
             print_json(&matches)?;
         } else {
@@ -725,28 +760,28 @@ async fn run_docs(as_json: bool, cfg: &AppConfig, args: DocsArgs) -> Result<(), 
         return Ok(());
     }
 
-    let results = if !args.library.is_empty() && backend == "context7" {
+    let results = if !args.library.is_empty() && backend == DocsBackend::Context7 {
         docs::docs_for_library(&query, &args.library, args.tokens, &cfg.context7_api_key)
             .await
-            .map_err(|err| classify_backend_error(err, "docs fetch failed"))?
+            .map_err(|err| CliError::from(err.with_upstream_context("docs fetch failed")))?
     } else {
-        docs::search(&backend, &query, limit, &cfg.context7_api_key)
+        docs::search(backend, &query, limit, &cfg.context7_api_key)
             .await
-            .map_err(|err| classify_backend_error(err, "docs search failed"))?
+            .map_err(|err| CliError::from(err.with_upstream_context("docs search failed")))?
     };
     let results = limit_docs_results(results, limit);
 
     if as_json {
         print_json(&results)?;
     } else {
-        print_docs_results(&query, &backend, &args.library, &results, args.minimal);
+        print_docs_results(&query, backend, &args.library, &results, args.minimal);
     }
     Ok(())
 }
 
 fn print_docs_results(
     query: &str,
-    backend: &str,
+    backend: DocsBackend,
     library: &str,
     results: &[DocsResult],
     minimal: bool,
@@ -794,6 +829,7 @@ fn limit_docs_results(mut results: Vec<DocsResult>, limit: usize) -> Vec<DocsRes
 
 async fn run_scrape(as_json: bool, cfg: &AppConfig, args: ScrapeArgs) -> Result<(), CliError> {
     let urls = resolve_urls(&args.urls)?;
+    validate_at_least_one("concurrency", args.concurrency)?;
     let single_url = urls.len() == 1;
     let options = ScrapeOutputOptions {
         raw: args.raw,
@@ -803,28 +839,21 @@ async fn run_scrape(as_json: bool, cfg: &AppConfig, args: ScrapeArgs) -> Result<
         no_llms_txt: args.no_llms_txt,
     };
     let scraper = new_scraper(cfg)?;
-    let cache = Arc::new(Mutex::new(new_page_cache(
+    let cache = new_page_cache(
         cfg,
         args.no_cache || options.raw || !options.select.is_empty(),
-    )?));
-    let client = reqwest::Client::new();
+    )?;
+    let client =
+        http::client(http::FETCH_TIMEOUT).map_err(|err| CliError::upstream(err.to_string()))?;
 
     let pages = if single_url {
         let raw_url = urls.first().expect("single URL exists");
-        let page = scrape_one_url(&scraper, &cache, &client, raw_url, &options)
+        let page = scrape_one_url(&scraper, cache.clone(), &client, raw_url, &options)
             .await
-            .map_err(classify_scrape_error)?;
+            .map_err(|err| CliError::from(err.with_upstream_context("scrape failed")))?;
         vec![page]
     } else {
-        scrape_many_urls(
-            &scraper,
-            &cache,
-            &client,
-            urls,
-            &options,
-            args.concurrency.max(1),
-        )
-        .await?
+        scrape_many_urls(&scraper, cache, &client, urls, &options, args.concurrency).await?
     };
 
     if as_json {
@@ -846,16 +875,16 @@ async fn run_scrape(as_json: bool, cfg: &AppConfig, args: ScrapeArgs) -> Result<
 
 async fn scrape_one_url(
     scraper: &Scraper,
-    cache: &Arc<Mutex<Option<PageCache>>>,
+    cache: Option<PageCache>,
     client: &reqwest::Client,
     raw_url: &str,
     options: &ScrapeOutputOptions,
-) -> eyre::Result<Page> {
+) -> AppResult<Page> {
     if options.raw {
         return scrape_raw_url(scraper, raw_url, options).await;
     }
 
-    let mut page = scrape_page(scraper, cache, client, raw_url, options).await?;
+    let mut page = scrape_page(scraper, cache.as_ref(), client, raw_url, options).await?;
     page.markdown = extract::post_process(&page.markdown, options.trim, options.max_chars);
     Ok(page)
 }
@@ -864,7 +893,7 @@ async fn scrape_raw_url(
     scraper: &Scraper,
     raw_url: &str,
     options: &ScrapeOutputOptions,
-) -> eyre::Result<Page> {
+) -> AppResult<Page> {
     let (html, fetched_url) = if options.select.is_empty() {
         let fetched_url = scraper.rewrite(raw_url);
         let html = scraper
@@ -881,7 +910,10 @@ async fn scrape_raw_url(
     } else {
         let selected = extract::extract_selector_html(&html, &options.select)?;
         if selected.is_empty() {
-            eyre::bail!("no elements matched selector {:?}", options.select);
+            return Err(AppError::not_found(format!(
+                "no elements matched selector {:?}",
+                options.select
+            )));
         }
         selected
     };
@@ -900,16 +932,19 @@ async fn scrape_raw_url(
 
 async fn scrape_page(
     scraper: &Scraper,
-    cache: &Arc<Mutex<Option<PageCache>>>,
+    cache: Option<&PageCache>,
     client: &reqwest::Client,
     raw_url: &str,
     options: &ScrapeOutputOptions,
-) -> eyre::Result<Page> {
+) -> AppResult<Page> {
     if !options.select.is_empty() {
         let (html, fetched_url) = scraper.fetch_with_browser_fallback(raw_url).await?;
         let markdown = extract::extract_selector(&html, &options.select)?;
         if markdown.is_empty() {
-            eyre::bail!("no elements matched selector {:?}", options.select);
+            return Err(AppError::not_found(format!(
+                "no elements matched selector {:?}",
+                options.select
+            )));
         }
         let mut page = Page {
             url: raw_url.to_string(),
@@ -932,40 +967,34 @@ async fn scrape_page(
             ..Page::default()
         });
     }
-    cached_scrape_shared(scraper, cache, raw_url).await
+    cached_scrape(scraper, cache, raw_url).await
 }
 
 async fn scrape_many_urls(
     scraper: &Scraper,
-    cache: &Arc<Mutex<Option<PageCache>>>,
+    cache: Option<PageCache>,
     client: &reqwest::Client,
     urls: Vec<String>,
     options: &ScrapeOutputOptions,
     concurrency: usize,
 ) -> Result<Vec<Page>, CliError> {
-    let mut results: Vec<Option<eyre::Result<Page>>> = (0..urls.len()).map(|_| None).collect();
-    let mut running = tokio::task::JoinSet::new();
-    let mut next = 0;
-
-    loop {
-        while running.len() < concurrency && next < urls.len() {
-            let index = next;
-            next += 1;
-
-            let raw_url = urls[index].clone();
+    let mut results: Vec<Option<AppResult<Page>>> = (0..urls.len()).map(|_| None).collect();
+    let workers = futures_util::stream::iter(urls.into_iter().enumerate())
+        .map(|(index, raw_url)| {
             let scraper = scraper.clone();
-            let cache = Arc::clone(cache);
+            let cache = cache.clone();
             let client = client.clone();
             let options = options.clone();
-            running.spawn(async move {
-                let result = scrape_one_url(&scraper, &cache, &client, &raw_url, &options).await;
-                (index, result)
-            });
-        }
 
-        let Some(joined) = running.join_next().await else {
-            break;
-        };
+            tokio::spawn(async move {
+                let result = scrape_one_url(&scraper, cache, &client, &raw_url, &options).await;
+                (index, result)
+            })
+        })
+        .buffer_unordered(concurrency.max(1));
+    futures_util::pin_mut!(workers);
+
+    while let Some(joined) = workers.next().await {
         let (index, result) =
             joined.map_err(|err| CliError::upstream(format!("scrape worker failed: {err}")))?;
         results[index] = Some(result);
@@ -981,37 +1010,11 @@ async fn scrape_many_urls(
     Ok(pages)
 }
 
-async fn cached_scrape_shared(
-    scraper: &Scraper,
-    cache: &Arc<Mutex<Option<PageCache>>>,
-    raw_url: &str,
-) -> eyre::Result<Page> {
-    let key = scraper.rewrite(raw_url);
-    let cached = {
-        let cache = cache.lock().expect("cache mutex is not poisoned");
-        cache.as_ref().and_then(|cache| cache.get(&key))
-    };
-    if let Some((page, source)) = cached
-        && !scrape::cache_stale_for_browser(&source, scraper.has_browser())
-    {
-        return Ok(page_for_request(page, raw_url, &key));
-    }
-
-    let (page, source) = scraper.scrape(raw_url).await?;
-    {
-        let cache = cache.lock().expect("cache mutex is not poisoned");
-        if let Some(cache) = cache.as_ref() {
-            cache.put(&key, &page, &source);
-        }
-    }
-    Ok(page)
-}
-
 async fn cached_scrape(
     scraper: &Scraper,
     cache: Option<&PageCache>,
     raw_url: &str,
-) -> eyre::Result<Page> {
+) -> AppResult<Page> {
     let key = scraper.rewrite(raw_url);
     if let Some(cache) = cache
         && let Some((page, source)) = cache.get(&key)
@@ -1044,7 +1047,7 @@ async fn run_crawl(as_json: bool, cfg: &AppConfig, args: CrawlArgs) -> Result<()
     match args.command {
         Some(CrawlCommand::Status { id }) => return run_crawl_status(as_json, id),
         Some(CrawlCommand::Stop { id }) => {
-            let mut status = crawl::read_status(&id)
+            let status = crawl::read_status(&id)
                 .map_err(|err| CliError::not_found(format!("crawl {id} not found: {err}")))?;
             if status.status != "running" {
                 return Err(CliError::precondition(format!(
@@ -1054,8 +1057,6 @@ async fn run_crawl(as_json: bool, cfg: &AppConfig, args: CrawlArgs) -> Result<()
             }
             send_stop_signal(status.pid)
                 .map_err(|err| CliError::upstream(format!("failed to stop crawl: {err}")))?;
-            status.status = "stopped".to_string();
-            crawl::write_status(&mut status).map_err(|err| CliError::upstream(err.to_string()))?;
             eprintln!("Sent stop signal to crawl {id} (pid {})", status.pid);
             return Ok(());
         }
@@ -1065,6 +1066,7 @@ async fn run_crawl(as_json: bool, cfg: &AppConfig, args: CrawlArgs) -> Result<()
     let seed = args
         .url
         .ok_or_else(|| CliError::validation("provide a URL for crawl"))?;
+    validate_at_least_one("concurrency", args.concurrency)?;
     if args.background {
         return run_crawl_background(&seed);
     }
@@ -1072,78 +1074,100 @@ async fn run_crawl(as_json: bool, cfg: &AppConfig, args: CrawlArgs) -> Result<()
     let cache = new_page_cache(cfg, args.no_cache)?;
     let scraper = new_scraper(cfg)?;
     let start = Instant::now();
-    let mut new_count = 0;
-    let mut changed = 0;
-    let mut unchanged = 0;
-    let mut errors = 0;
+    let mut total: usize = 0;
+    let mut new_count: usize = 0;
+    let mut changed: usize = 0;
+    let mut unchanged: usize = 0;
+    let mut errors: usize = 0;
     let mut print_error = None;
     let mut first_page = true;
 
-    let results = crawl::crawl_with_callback(
-        &seed,
-        &scraper,
-        CrawlOptions {
-            depth: args.depth,
-            concurrency: args.concurrency,
-            allow: args.allow,
-            deny: args.deny,
-        },
-        cache.as_ref(),
-        args.sitemap,
-        |result| {
-            if !result.error.is_empty() {
-                errors += 1;
-                eprintln!("warn: {}: {}", result.url, result.error);
-                return;
-            }
-            match result.status.as_str() {
-                "new" => new_count += 1,
-                "changed" => changed += 1,
-                "unchanged" => unchanged += 1,
-                _ => {}
-            }
-            if let Some(page) = &result.page {
-                if as_json {
-                    let mut value = serde_json::json!({
-                        "url": page.url,
-                        "title": page.title,
-                        "words": page.markdown.split_whitespace().count(),
-                        "status": result.status,
-                        "source": result.source,
-                        "body": page.markdown
-                    });
-                    if !page.fetched_url.is_empty() {
-                        value["fetched_url"] = serde_json::json!(page.fetched_url);
-                    }
-                    if let Err(err) = print_json_line(&value) {
-                        print_error = Some(err);
-                    }
-                } else {
-                    if !first_page {
-                        println!();
-                    }
-                    first_page = false;
-                    print_crawl_page(result, page);
+    let crawl_outcome = {
+        let crawl = crawl::crawl_with_callback(
+            &seed,
+            &scraper,
+            CrawlOptions {
+                depth: args.depth,
+                concurrency: args.concurrency,
+                allow: args.allow,
+                deny: args.deny,
+            },
+            cache.as_ref(),
+            args.sitemap,
+            |result| {
+                total += 1;
+                if !result.error.is_empty() {
+                    errors += 1;
+                    eprintln!("warn: {}: {}", result.url, result.error);
+                    return;
                 }
-            }
-        },
-    )
-    .await
-    .map_err(|err| CliError::upstream(format!("crawl failed: {err}")))?;
+                match result.status.as_str() {
+                    "new" => new_count += 1,
+                    "changed" => changed += 1,
+                    "unchanged" => unchanged += 1,
+                    _ => {}
+                }
+                if let Some(page) = &result.page {
+                    if as_json {
+                        let mut value = serde_json::json!({
+                            "url": page.url,
+                            "title": page.title,
+                            "words": page.markdown.split_whitespace().count(),
+                            "status": result.status,
+                            "source": result.source,
+                            "body": page.markdown
+                        });
+                        if !page.fetched_url.is_empty() {
+                            value["fetched_url"] = serde_json::json!(page.fetched_url);
+                        }
+                        if let Err(err) = print_json(&value) {
+                            print_error = Some(err);
+                        }
+                    } else {
+                        if !first_page {
+                            println!();
+                        }
+                        first_page = false;
+                        print_crawl_page(result, page);
+                    }
+                }
+            },
+        );
+        tokio::pin!(crawl);
+        tokio::select! {
+            result = &mut crawl => CrawlOutcome::Finished(result),
+            signal = shutdown_signal() => CrawlOutcome::Cancelled(signal),
+        }
+    };
 
     if let Some(err) = print_error {
         return Err(err);
     }
+    let cancelled_by = match crawl_outcome {
+        CrawlOutcome::Finished(result) => {
+            result.map_err(|err| CliError::upstream(format!("crawl failed: {err}")))?;
+            None
+        }
+        CrawlOutcome::Cancelled(signal) => Some(signal),
+    };
     print_crawl_summary(
         &seed,
-        results.len().saturating_sub(errors),
+        total.saturating_sub(errors),
         new_count,
         changed,
         unchanged,
         errors,
         start.elapsed().as_secs_f64(),
     );
+    if let Some(signal) = cancelled_by {
+        return Err(CliError::cancelled(format!("cancelled by {signal}")));
+    }
     Ok(())
+}
+
+enum CrawlOutcome<T> {
+    Finished(T),
+    Cancelled(&'static str),
 }
 
 fn run_crawl_background(seed: &str) -> Result<(), CliError> {
@@ -1218,6 +1242,7 @@ async fn run_crawl_worker(
     let seed = args
         .url
         .ok_or_else(|| CliError::validation("provide a URL for crawl"))?;
+    validate_at_least_one("concurrency", args.concurrency)?;
     let mut status = crawl::CrawlStatus {
         id: crawl_id.to_string(),
         pid: std::process::id(),
@@ -1234,60 +1259,72 @@ async fn run_crawl_worker(
     };
     let _ = crawl::write_status(&mut status);
 
-    let run_result = async {
-        let cache = new_page_cache(cfg, args.no_cache)?;
-        let scraper = new_scraper(cfg)?;
-        let mut status_error = None;
-        let results = crawl::crawl_with_callback(
-            &seed,
-            &scraper,
-            CrawlOptions {
-                depth: args.depth,
-                concurrency: args.concurrency,
-                allow: args.allow,
-                deny: args.deny,
-            },
-            cache.as_ref(),
-            args.sitemap,
-            |result| {
-                status.pages += 1;
-                if !result.error.is_empty() {
-                    status.errors += 1;
-                } else {
-                    match result.status.as_str() {
-                        "new" => status.new += 1,
-                        "changed" => status.changed += 1,
-                        "unchanged" => status.unchanged += 1,
-                        _ => {}
+    let run_result = {
+        let crawl = async {
+            let cache = new_page_cache(cfg, args.no_cache)?;
+            let scraper = new_scraper(cfg)?;
+            let mut status_error = None;
+            let results = crawl::crawl_with_callback(
+                &seed,
+                &scraper,
+                CrawlOptions {
+                    depth: args.depth,
+                    concurrency: args.concurrency,
+                    allow: args.allow,
+                    deny: args.deny,
+                },
+                cache.as_ref(),
+                args.sitemap,
+                |result| {
+                    status.pages += 1;
+                    if !result.error.is_empty() {
+                        status.errors += 1;
+                    } else {
+                        match result.status.as_str() {
+                            "new" => status.new += 1,
+                            "changed" => status.changed += 1,
+                            "unchanged" => status.unchanged += 1,
+                            _ => {}
+                        }
                     }
-                }
-                if status.pages.is_multiple_of(10)
-                    && let Err(err) = crawl::write_status(&mut status)
-                {
-                    status_error = Some(CliError::upstream(err.to_string()));
-                }
-            },
-        )
-        .await
-        .map_err(|err| CliError::upstream(format!("crawl failed: {err}")))?;
-        if let Some(err) = status_error {
-            Err(err)
-        } else {
-            Ok(results)
+                    if status.pages.is_multiple_of(10)
+                        && let Err(err) = crawl::write_status(&mut status)
+                    {
+                        status_error = Some(CliError::upstream(err.to_string()));
+                    }
+                },
+            )
+            .await
+            .map_err(|err| CliError::upstream(format!("crawl failed: {err}")))?;
+            if let Some(err) = status_error {
+                Err(err)
+            } else {
+                Ok(results)
+            }
+        };
+        tokio::pin!(crawl);
+        tokio::select! {
+            result = &mut crawl => CrawlOutcome::Finished(result),
+            _signal = shutdown_signal() => CrawlOutcome::Cancelled("signal"),
         }
-    }
-    .await;
+    };
 
     match run_result {
-        Ok(_) => {
+        CrawlOutcome::Finished(Ok(_)) => {
             status.status = "completed".to_string();
             crawl::write_status(&mut status).map_err(|err| CliError::upstream(err.to_string()))?;
             Ok(())
         }
-        Err(err) => {
+        CrawlOutcome::Finished(Err(err)) => {
             mark_crawl_status_failed(&mut status, err.message.clone());
             let _ = crawl::write_status(&mut status);
             Err(err)
+        }
+        CrawlOutcome::Cancelled(_) => {
+            status.status = "stopped".to_string();
+            status.error.clear();
+            crawl::write_status(&mut status).map_err(|err| CliError::upstream(err.to_string()))?;
+            Ok(())
         }
     }
 }
@@ -1461,13 +1498,13 @@ async fn run_config(as_json: bool, cfg: &AppConfig, args: ConfigArgs) -> Result<
             );
             let info = ConfigInfo {
                 config_path: path,
-                backend: cfg.backend.clone(),
+                backend: cfg.backend,
                 searxng_url: cfg.searxng_url.clone(),
                 limit: cfg.limit,
                 cache_ttl: cfg.cache_ttl.clone(),
                 browser: cfg.browser.clone(),
-                code_backend: cfg.code_backend.clone(),
-                docs_backend: cfg.docs_backend.clone(),
+                code_backend: cfg.code_backend,
+                docs_backend: cfg.docs_backend,
                 sourcegraph_url: cfg.sourcegraph_url.clone(),
                 github_token_source: gh_source,
                 url_rewrites: cfg.url_rewrites.clone(),
@@ -1531,7 +1568,9 @@ async fn run_config(as_json: bool, cfg: &AppConfig, args: ConfigArgs) -> Result<
 
 fn apply_config_set(cfg: &mut AppConfig, key: &str, value: &str) -> Result<(), CliError> {
     match key {
-        "backend" => cfg.backend = value.to_string(),
+        "backend" => {
+            cfg.backend = SearchBackend::parse(value).map_err(CliError::validation)?;
+        }
         "searxng_url" => cfg.searxng_url = value.to_string(),
         "brave_api_key" => cfg.brave_api_key = value.to_string(),
         "exa_api_key" => cfg.exa_api_key = value.to_string(),
@@ -1549,8 +1588,12 @@ fn apply_config_set(cfg: &mut AppConfig, key: &str, value: &str) -> Result<(), C
             cfg.cache_ttl = value.to_string();
         }
         "browser" => cfg.browser = value.to_string(),
-        "code_backend" => cfg.code_backend = value.to_string(),
-        "docs_backend" => cfg.docs_backend = value.to_string(),
+        "code_backend" => {
+            cfg.code_backend = CodeBackend::parse(value).map_err(CliError::validation)?;
+        }
+        "docs_backend" => {
+            cfg.docs_backend = DocsBackend::parse(value).map_err(CliError::validation)?;
+        }
         "context7_api_key" => cfg.context7_api_key = value.to_string(),
         "sourcegraph_url" => cfg.sourcegraph_url = value.to_string(),
         "github_token" => cfg.github_token = value.to_string(),
@@ -1616,12 +1659,14 @@ async fn run_version(as_json: bool) -> Result<(), CliError> {
         timeout: std::time::Duration::from_secs(1),
     })
     .await;
+    let commit = build_commit();
+    let date = build_date();
 
     if as_json {
         print_json(&serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
-            "commit": "",
-            "date": "",
+            "commit": commit,
+            "date": date,
             "rust": rust_version(),
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
@@ -1629,6 +1674,12 @@ async fn run_version(as_json: bool) -> Result<(), CliError> {
         }))?;
     } else {
         println!("snarf {}", env!("CARGO_PKG_VERSION"));
+        if !commit.is_empty() {
+            println!("  commit: {commit}");
+        }
+        if !date.is_empty() {
+            println!("  built:  {date}");
+        }
         println!(
             "  rust:   {} {}/{}",
             rust_version(),
@@ -1652,6 +1703,14 @@ fn rust_version() -> &'static str {
     option_env!("RUSTC_VERSION").unwrap_or("unknown")
 }
 
+fn build_commit() -> &'static str {
+    option_env!("SNARF_BUILD_COMMIT").unwrap_or("")
+}
+
+fn build_date() -> &'static str {
+    option_env!("SNARF_BUILD_DATE").unwrap_or("")
+}
+
 fn resolve_urls(args: &[String]) -> Result<Vec<String>, CliError> {
     if args.len() > 1 {
         return Ok(args.to_vec());
@@ -1666,10 +1725,7 @@ fn resolve_urls(args: &[String]) -> Result<Vec<String>, CliError> {
             }
             return Ok(urls);
         }
-        if fs::metadata(arg)
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false)
-        {
+        if fs::metadata(arg).is_ok() {
             let urls = read_lines(
                 &fs::read_to_string(arg)
                     .map_err(|err| CliError::validation(format!("failed to open {arg}: {err}")))?,
@@ -1782,26 +1838,11 @@ fn first_line(input: &str) -> String {
         .to_string()
 }
 
-fn classify_backend_error(error: eyre::Report, prefix: &str) -> CliError {
-    let message = error.to_string();
-    if message.contains("API key not set") || message.contains("token required") {
-        CliError::precondition(message)
-    } else if message.starts_with("unknown ") {
-        CliError::validation(message)
-    } else {
-        CliError::upstream(format!("{prefix}: {message}"))
+fn validate_at_least_one(name: &str, value: usize) -> Result<(), CliError> {
+    if value == 0 {
+        return Err(CliError::validation(format!("{name} must be at least 1")));
     }
-}
-
-fn classify_scrape_error(error: eyre::Report) -> CliError {
-    let message = error.to_string();
-    if message.starts_with("no elements matched selector") {
-        CliError::not_found(message)
-    } else if message.starts_with("invalid selector") {
-        CliError::validation(message)
-    } else {
-        CliError::upstream(format!("scrape failed: {message}"))
-    }
+    Ok(())
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
@@ -1816,10 +1857,6 @@ fn print_json_pretty<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
         .map_err(|err| CliError::upstream(err.to_string()))?;
     println!();
     Ok(())
-}
-
-fn print_json_line<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
-    print_json(value)
 }
 
 #[cfg(test)]
@@ -1891,6 +1928,21 @@ mod tests {
         apply_config_set(&mut config, "cache_ttl", "1h30m").unwrap();
 
         assert_eq!(config.cache_ttl, "1h30m");
+    }
+
+    #[test]
+    fn config_set_rejects_invalid_backends() {
+        let mut config = AppConfig::default();
+
+        for key in ["backend", "code_backend", "docs_backend"] {
+            let error = apply_config_set(&mut config, key, "missing").unwrap_err();
+
+            assert!(
+                error.message.contains("invalid value"),
+                "{key} error was {:?}",
+                error.message
+            );
+        }
     }
 
     #[test]

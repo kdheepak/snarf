@@ -2096,6 +2096,7 @@ dependencies = [
  "color-eyre",
  "directories",
  "fs2",
+ "futures-util",
  "hex",
  "html2md",
  "quick-xml",

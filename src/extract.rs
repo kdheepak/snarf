@@ -4,6 +4,8 @@ use color_eyre::eyre;
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 
+use crate::error::{AppError, AppResult};
+
 #[derive(Debug, Clone, Default)]
 pub struct Extracted {
     pub title: String,
@@ -175,7 +177,7 @@ const NEGATIVE_CONTENT_HINTS: &[&str] = &[
     "social",
 ];
 
-pub fn extract_selector(raw_html: &str, selector: &str) -> eyre::Result<String> {
+pub fn extract_selector(raw_html: &str, selector: &str) -> AppResult<String> {
     let html = extract_selector_html(raw_html, selector)?;
     if html.is_empty() {
         return Ok(String::new());
@@ -184,10 +186,10 @@ pub fn extract_selector(raw_html: &str, selector: &str) -> eyre::Result<String> 
     Ok(html2md::parse_html(&html).trim().to_string())
 }
 
-pub fn extract_selector_html(raw_html: &str, selector: &str) -> eyre::Result<String> {
+pub fn extract_selector_html(raw_html: &str, selector: &str) -> AppResult<String> {
     let document = Html::parse_document(raw_html);
-    let selector =
-        Selector::parse(selector).map_err(|_| eyre::eyre!("invalid selector: {selector}"))?;
+    let selector = Selector::parse(selector)
+        .map_err(|_| AppError::validation(format!("invalid selector: {selector}")))?;
 
     let mut html = String::new();
     for element in document.select(&selector) {

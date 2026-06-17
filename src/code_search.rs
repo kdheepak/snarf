@@ -1,13 +1,14 @@
-use std::collections::HashMap;
-use std::time::Duration;
-
 use chrono::{DateTime, Utc};
 use color_eyre::eyre;
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 
+use crate::config::CodeBackend;
+use crate::error::{AppError, AppResult};
+use crate::http;
 use crate::types::CodeResult;
 
 #[derive(Debug, Clone)]
@@ -19,21 +20,20 @@ pub struct CodeQuery {
 }
 
 pub async fn search(
-    backend: &str,
+    backend: CodeBackend,
     query: CodeQuery,
     sourcegraph_url: &str,
     github_token: &str,
-) -> eyre::Result<Vec<CodeResult>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .user_agent("Mozilla/5.0 (compatible; snarf/1.0)")
-        .build()?;
+) -> AppResult<Vec<CodeResult>> {
+    let client = http::client(http::CODE_SEARCH_TIMEOUT)
+        .map_err(|err| AppError::upstream(err.to_string()))?;
 
     match backend {
-        "grepapp" => grepapp(&client, &query).await,
-        "sourcegraph" => sourcegraph(&client, &query, sourcegraph_url).await,
-        "github" => github(&client, &query, github_token).await,
-        _ => eyre::bail!("unknown code backend: {backend}"),
+        CodeBackend::Grepapp => grepapp(&client, &query).await.map_err(AppError::from),
+        CodeBackend::Sourcegraph => sourcegraph(&client, &query, sourcegraph_url)
+            .await
+            .map_err(AppError::from),
+        CodeBackend::Github => github(&client, &query, github_token).await,
     }
 }
 
@@ -349,12 +349,12 @@ async fn github(
     client: &reqwest::Client,
     query: &CodeQuery,
     token: &str,
-) -> eyre::Result<Vec<CodeResult>> {
+) -> AppResult<Vec<CodeResult>> {
     if token.is_empty() {
-        eyre::bail!("github: token required");
+        return Err(AppError::precondition("github: token required"));
     }
     if query.regexp {
-        eyre::bail!("REGEX_UNSUPPORTED");
+        return Err(AppError::RegexUnsupported);
     }
 
     let response = github_search_code(client, query, token).await?;

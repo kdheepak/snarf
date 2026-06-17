@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -8,6 +8,8 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+use crate::fs_atomic;
+use crate::http;
 
 const CHECK_TTL_HOURS: i64 = 24;
 const FAILED_RETRY_HOURS: i64 = 6;
@@ -177,10 +179,7 @@ fn status_from_state(
 }
 
 async fn fetch_latest_release(timeout: Duration) -> eyre::Result<ReleaseInfo> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .user_agent("snarf")
-        .build()?;
+    let client = http::snarf_client(timeout)?;
     let release: GitHubRelease = client
         .get(release_api_url())
         .header("Accept", "application/vnd.github+json")
@@ -213,20 +212,7 @@ fn save_state(state: &CacheState) -> eyre::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    write_file_atomic(
-        &path,
-        &format!("{}\n", serde_json::to_string_pretty(state)?),
-    )?;
-    Ok(())
-}
-
-fn write_file_atomic(path: &Path, contents: &str) -> eyre::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, contents)?;
-    fs::rename(tmp_path, path)?;
+    fs_atomic::write(&path, format!("{}\n", serde_json::to_string_pretty(state)?))?;
     Ok(())
 }
 
@@ -410,16 +396,9 @@ fn command_from_cached_state(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::{
-        UpdateStatus, command_from_cached_state, compare_versions, format_notice,
-        normalize_version, write_file_atomic,
+        UpdateStatus, command_from_cached_state, compare_versions, format_notice, normalize_version,
     };
-
-    static NEXT_UPDATE_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn normalizes_release_tags() {
@@ -462,21 +441,5 @@ mod tests {
             command_from_cached_state("", "current command", false),
             "current command"
         );
-    }
-
-    #[test]
-    fn atomic_write_replaces_file_and_removes_temp_file() {
-        let id = NEXT_UPDATE_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("updatecheck-tests")
-            .join(format!("atomic-{}-{id}", std::process::id()));
-        let path = root.join("update-check.json");
-
-        write_file_atomic(&path, "first\n").expect("first write succeeds");
-        write_file_atomic(&path, "second\n").expect("second write succeeds");
-
-        assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
-        assert!(!path.with_extension("json.tmp").exists());
     }
 }

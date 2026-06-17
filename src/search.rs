@@ -6,27 +6,31 @@ use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::config::SearchBackend;
+use crate::error::{AppError, AppResult};
+use crate::http;
 use crate::types::SearchResult;
 
 pub async fn search(
-    backend: &str,
+    backend: SearchBackend,
     query: &str,
     limit: usize,
     searxng_url: &str,
     brave_api_key: &str,
     exa_api_key: &str,
-) -> eyre::Result<Vec<SearchResult>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (compatible; snarf/1.0)")
-        .build()?;
+) -> AppResult<Vec<SearchResult>> {
+    let client =
+        http::client(http::FETCH_TIMEOUT).map_err(|err| AppError::upstream(err.to_string()))?;
 
     match backend {
-        "brave" => brave(&client, query, limit, brave_api_key).await,
-        "searxng" => searxng(&client, query, limit, searxng_url).await,
-        "ddg" => ddg(&client, query, limit).await,
-        "exa" => exa(&client, query, limit, exa_api_key).await,
-        _ => eyre::bail!("unknown backend: {backend}"),
+        SearchBackend::Brave => brave(&client, query, limit, brave_api_key).await,
+        SearchBackend::Searxng => searxng(&client, query, limit, searxng_url)
+            .await
+            .map_err(AppError::from),
+        SearchBackend::Ddg => ddg(&client, query, limit).await.map_err(AppError::from),
+        SearchBackend::Exa => exa(&client, query, limit, exa_api_key)
+            .await
+            .map_err(AppError::from),
     }
 }
 
@@ -35,7 +39,7 @@ async fn brave(
     query: &str,
     limit: usize,
     api_key: &str,
-) -> eyre::Result<Vec<SearchResult>> {
+) -> AppResult<Vec<SearchResult>> {
     brave_from_url(
         client,
         "https://api.search.brave.com/res/v1/web/search",
@@ -52,11 +56,11 @@ async fn brave_from_url(
     query: &str,
     limit: usize,
     api_key: &str,
-) -> eyre::Result<Vec<SearchResult>> {
+) -> AppResult<Vec<SearchResult>> {
     if api_key.is_empty() {
-        eyre::bail!(
-            "brave: API key not set (get one free at https://brave.com/search/api/ then: snarf config set brave_api_key <key>)"
-        );
+        return Err(AppError::precondition(
+            "brave: API key not set (get one free at https://brave.com/search/api/ then: snarf config set brave_api_key <key>)",
+        ));
     }
 
     let response = client
@@ -75,13 +79,18 @@ async fn brave_from_url(
 
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        eyre::bail!("brave: invalid API key (set via: snarf config set brave_api_key <key>)");
+        return Err(AppError::upstream(
+            "brave: invalid API key (set via: snarf config set brave_api_key <key>)",
+        ));
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        eyre::bail!("brave: rate limited");
+        return Err(AppError::upstream("brave: rate limited"));
     }
     if status != reqwest::StatusCode::OK {
-        eyre::bail!("brave returned status {}", status.as_u16());
+        return Err(AppError::upstream(format!(
+            "brave returned status {}",
+            status.as_u16()
+        )));
     }
 
     let body: BraveResponse = response
@@ -435,71 +444,13 @@ fn known_exa_prefix(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
-    use std::time::Duration;
-
     use super::{
         BraveResponse, SearxngResponse, brave_from_url, brave_results, exa_endpoint, exa_from_url,
         exa_request_body, extract_ddg_url, extract_sse_payload, fetch_ddg_from_url,
         parse_ddg_results, parse_exa_content, searxng, searxng_results,
     };
-
-    struct TestResponse {
-        status: &'static str,
-        content_type: &'static str,
-        body: &'static str,
-    }
-
-    fn serve_test_responses(
-        responses: Vec<TestResponse>,
-    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("test server binds");
-        listener
-            .set_nonblocking(true)
-            .expect("test server can be nonblocking");
-        let url = format!(
-            "http://{}",
-            listener.local_addr().expect("test server has addr")
-        );
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let server_requests = Arc::clone(&requests);
-        let server = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            let mut index = 0;
-            while index < responses.len() && std::time::Instant::now() < deadline {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("test server sets read timeout");
-                let mut request = [0; 8192];
-                let n = stream.read(&mut request).unwrap_or_default();
-                server_requests
-                    .lock()
-                    .expect("test request lock")
-                    .push(String::from_utf8_lossy(&request[..n]).into_owned());
-                let response = &responses[index];
-                index += 1;
-                write!(
-                    stream,
-                    "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    response.status,
-                    response.content_type,
-                    response.body.len(),
-                    response.body
-                )
-                .expect("test server writes response");
-            }
-        });
-        (url, requests, server)
-    }
+    use crate::http;
+    use crate::testserver::{TestHttpServer, TestResponse};
 
     #[test]
     fn parses_brave_results() {
@@ -547,25 +498,20 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_brave_non_ok_success_status() {
-        let (url, requests, server) = serve_test_responses(vec![TestResponse {
-            status: "201 Created",
-            content_type: "application/json",
-            body: r#"{"web": {"results": []}}"#,
-        }]);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .no_proxy()
-            .build()
-            .expect("test client builds");
+        let server = TestHttpServer::responses(vec![TestResponse::new(
+            "201 Created",
+            "application/json",
+            r#"{"web": {"results": []}}"#,
+        )]);
+        let client = http::client(http::TEST_TIMEOUT).expect("test client builds");
 
-        let err = brave_from_url(&client, &url, "test", 5, "key")
+        let err = brave_from_url(&client, &server.url, "test", 5, "key")
             .await
             .expect_err("brave rejects non-200 success status");
 
-        server.join().expect("test server exits");
         assert!(err.to_string().contains("201"));
         assert!(
-            requests.lock().expect("test request lock")[0]
+            server.requests()[0]
                 .to_ascii_lowercase()
                 .contains("x-subscription-token: key")
         );
@@ -612,22 +558,17 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_searxng_non_ok_success_status() {
-        let (url, _requests, server) = serve_test_responses(vec![TestResponse {
-            status: "201 Created",
-            content_type: "application/json",
-            body: r#"{"results": []}"#,
-        }]);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .no_proxy()
-            .build()
-            .expect("test client builds");
+        let server = TestHttpServer::responses(vec![TestResponse::new(
+            "201 Created",
+            "application/json",
+            r#"{"results": []}"#,
+        )]);
+        let client = http::client(http::TEST_TIMEOUT).expect("test client builds");
 
-        let err = searxng(&client, "test", 5, &url)
+        let err = searxng(&client, "test", 5, &server.url)
             .await
             .expect_err("searxng rejects non-200 success status");
 
-        server.join().expect("test server exits");
         assert!(err.to_string().contains("201"));
     }
 
@@ -699,88 +640,42 @@ data: {"result":{"content":[]}}
 
     #[tokio::test]
     async fn rejects_exa_non_ok_success_status() {
-        let (url, _requests, server) = serve_test_responses(vec![TestResponse {
-            status: "201 Created",
-            content_type: "text/event-stream",
-            body: r#"data: {"result":{"content":[{"type":"text","text":"Title: Rust\nURL: https://www.rust-lang.org/\nHighlights:\nRust"}]}}"#,
-        }]);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .no_proxy()
-            .build()
-            .expect("test client builds");
+        let server = TestHttpServer::responses(vec![TestResponse::new(
+            "201 Created",
+            "text/event-stream",
+            r#"data: {"result":{"content":[{"type":"text","text":"Title: Rust\nURL: https://www.rust-lang.org/\nHighlights:\nRust"}]}}"#,
+        )]);
+        let client = http::client(http::TEST_TIMEOUT).expect("test client builds");
 
-        let err = exa_from_url(&client, &url, "rust", 5, "")
+        let err = exa_from_url(&client, &server.url, "rust", 5, "")
             .await
             .expect_err("exa rejects non-200 success status");
 
-        server.join().expect("test server exits");
         assert!(err.to_string().contains("201"));
     }
 
     #[tokio::test]
     async fn retries_ddg_accepted_responses() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("test server binds");
-        listener
-            .set_nonblocking(true)
-            .expect("test server can be nonblocking");
-        let url = format!(
-            "http://{}/html/",
-            listener.local_addr().expect("server has addr")
-        );
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let server_attempts = Arc::clone(&attempts);
-        let server = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while server_attempts.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline
-            {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("test server sets read timeout");
-                let mut request = [0; 2048];
-                let _ = stream.read(&mut request);
-                let attempt = server_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                if attempt < 3 {
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .expect("test server writes 202 response");
-                } else {
-                    let body = r#"<html><body>
-                        <div class="result">
-                            <h2 class="result__title"><a class="result__a" href="https://example.com">Example</a></h2>
-                            <div class="result__snippet">After retries</div>
-                        </div>
-                    </body></html>"#;
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    )
-                    .expect("test server writes 200 response");
-                }
-            }
-        });
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .no_proxy()
-            .build()
-            .expect("test client builds");
+        let body = r#"<html><body>
+            <div class="result">
+                <h2 class="result__title"><a class="result__a" href="https://example.com">Example</a></h2>
+                <div class="result__snippet">After retries</div>
+            </div>
+        </body></html>"#;
+        let server = TestHttpServer::responses(vec![
+            TestResponse::new("202 Accepted", "text/plain", ""),
+            TestResponse::new("202 Accepted", "text/plain", ""),
+            TestResponse::new("200 OK", "text/html", body),
+        ]);
+        let client = http::client(http::TEST_TIMEOUT).expect("test client builds");
 
-        let response = fetch_ddg_from_url(&client, &url, "test")
+        let response = fetch_ddg_from_url(&client, &format!("{}/html/", server.url), "test")
             .await
             .expect("ddg fetch retries accepted responses");
         let body = response.text().await.expect("response body reads");
         let results = parse_ddg_results(&body, 5);
 
-        server.join().expect("test server exits");
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(server.requests().len(), 3);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Example");
         assert_eq!(results[0].description, "After retries");

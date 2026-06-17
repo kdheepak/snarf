@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config;
+use crate::fs_atomic;
 use crate::types::Page;
 
 #[derive(Debug, Clone)]
@@ -133,14 +134,8 @@ fn read_entries(path: &PathBuf) -> eyre::Result<HashMap<String, CacheEntry>> {
 }
 
 fn write_entries(path: &PathBuf, entries: &HashMap<String, CacheEntry>) -> eyre::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp_path = path.with_extension("json.tmp");
     let data = serde_json::to_string(entries)?;
-    fs::write(&tmp_path, data)?;
-    fs::rename(tmp_path, path)?;
-    Ok(())
+    fs_atomic::write(path, data)
 }
 
 #[derive(Debug, Clone, Copy)]

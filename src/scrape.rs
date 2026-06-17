@@ -1,17 +1,17 @@
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use color_eyre::eyre;
 use reqwest::header::{
-    ACCEPT, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, USER_AGENT,
+    ACCEPT, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::config;
 use crate::extract;
+use crate::http;
 use crate::types::Page;
 use crate::urlrewrite::{self, Rewriter};
 
@@ -38,10 +38,7 @@ pub struct FetchResult {
 
 impl Scraper {
     pub fn new(browser: String, rewriter: Option<Rewriter>) -> eyre::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("Mozilla/5.0 (compatible; snarf/1.0)")
-            .build()?;
+        let client = http::client(http::FETCH_TIMEOUT)?;
         Ok(Self {
             client,
             browser,
@@ -61,7 +58,6 @@ impl Scraper {
         let response = self
             .client
             .get(raw_url)
-            .header(USER_AGENT, "Mozilla/5.0 (compatible; snarf/1.0)")
             .header(ACCEPT, "text/html,application/xhtml+xml")
             .send()
             .await
@@ -113,7 +109,6 @@ impl Scraper {
         let mut request = self
             .client
             .get(&fetch_url)
-            .header(USER_AGENT, "Mozilla/5.0 (compatible; snarf/1.0)")
             .header(ACCEPT, "text/html,application/xhtml+xml");
         if !etag.is_empty() {
             request = request.header(IF_NONE_MATCH, etag);
@@ -231,7 +226,7 @@ impl Scraper {
 async fn browser_fetch(browser_config: &str, raw_url: &str) -> eyre::Result<String> {
     let browser = resolve_browser_bin(browser_config)?;
     let output = tokio::time::timeout(
-        Duration::from_secs(30),
+        http::BROWSER_TIMEOUT,
         tokio::process::Command::new(browser)
             .arg("--headless=new")
             .arg("--disable-gpu")
@@ -302,10 +297,7 @@ pub fn resolve_browser_bin(config_value: &str) -> eyre::Result<String> {
 }
 
 pub async fn install_browser() -> eyre::Result<String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .user_agent("Mozilla/5.0 (compatible; snarf/1.0)")
-        .build()?;
+    let client = http::client(http::INSTALL_TIMEOUT)?;
     let platform = chrome_for_testing_platform()?;
     let metadata: ChromeForTestingVersions = client
         .get("https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json")
@@ -495,7 +487,7 @@ pub async fn fetch_llms_txt(client: &reqwest::Client, base_url: &str) -> Option<
     parsed.set_fragment(None);
     let response = client
         .get(parsed)
-        .timeout(Duration::from_secs(5))
+        .timeout(http::LLMS_TXT_TIMEOUT)
         .send()
         .await
         .ok()?;
@@ -517,13 +509,9 @@ pub async fn fetch_llms_txt(client: &reqwest::Client, base_url: &str) -> Option<
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::time::{Duration, Instant};
 
+    use crate::http;
+    use crate::testserver::TestHttpServer;
     use crate::urlrewrite::{Rewriter, Rule};
 
     use super::{Scraper, fetch_llms_txt, read_limited_text_with_limit};
@@ -569,7 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn scrape_applies_rewrite_and_sets_fetched_url() {
-        let server = TestHttpServer::new(HashMap::from([(
+        let server = TestHttpServer::routes(HashMap::from([(
             "/old".to_string(),
             "<html><head><title>Old</title></head><body><p>hello world from old</p></body></html>"
                 .to_string(),
@@ -592,7 +580,7 @@ mod tests {
 
     #[tokio::test]
     async fn scrape_leaves_fetched_url_empty_without_rewrite() {
-        let server = TestHttpServer::new(HashMap::from([(
+        let server = TestHttpServer::routes(HashMap::from([(
             "/foo".to_string(),
             "<html><head><title>Foo</title></head><body><p>hello</p></body></html>".to_string(),
         )]));
@@ -607,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn scrape_conditional_applies_rewrite_and_sets_fetched_url() {
-        let server = TestHttpServer::new(HashMap::from([(
+        let server = TestHttpServer::routes(HashMap::from([(
             "/dst".to_string(),
             "<html><head><title>X</title></head><body><p>hi</p></body></html>".to_string(),
         )]));
@@ -629,11 +617,14 @@ mod tests {
 
     #[tokio::test]
     async fn response_body_limit_is_enforced_while_reading() {
-        let server = TestHttpServer::new(HashMap::from([(
+        let server = TestHttpServer::routes(HashMap::from([(
             "/large".to_string(),
             "0123456789".to_string(),
         )]));
-        let response = reqwest::get(format!("{}/large", server.url))
+        let response = http::client(http::TEST_TIMEOUT)
+            .expect("test client builds")
+            .get(format!("{}/large", server.url))
+            .send()
             .await
             .expect("request succeeds");
 
@@ -646,105 +637,15 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_llms_txt_preserves_server_port() {
-        let server = TestHttpServer::new(HashMap::from([(
+        let server = TestHttpServer::routes(HashMap::from([(
             "/llms.txt".to_string(),
             "# Test llms\n".to_string(),
         )]));
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("test client builds");
+        let client = http::client(http::TEST_TIMEOUT).expect("test client builds");
 
         let content = fetch_llms_txt(&client, &server.url).await;
 
         assert_eq!(content.as_deref(), Some("# Test llms\n"));
         assert_eq!(server.paths(), vec!["/llms.txt".to_string()]);
-    }
-
-    struct TestHttpServer {
-        url: String,
-        paths: Arc<Mutex<Vec<String>>>,
-        stop: Arc<AtomicBool>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl TestHttpServer {
-        fn new(routes: HashMap<String, String>) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("test server binds");
-            listener
-                .set_nonblocking(true)
-                .expect("test server can be nonblocking");
-            let url = format!("http://{}", listener.local_addr().expect("server has addr"));
-            let routes = Arc::new(routes);
-            let paths = Arc::new(Mutex::new(Vec::new()));
-            let server_paths = Arc::clone(&paths);
-            let stop = Arc::new(AtomicBool::new(false));
-            let server_stop = Arc::clone(&stop);
-
-            let handle = thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-                    let Ok((mut stream, _)) = listener.accept() else {
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    };
-                    stream
-                        .set_nonblocking(false)
-                        .expect("test connection can be blocking");
-
-                    let mut request = [0u8; 4096];
-                    let n = stream.read(&mut request).unwrap_or_default();
-                    let request = String::from_utf8_lossy(&request[..n]);
-                    let path = request
-                        .lines()
-                        .next()
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap_or("/")
-                        .to_string();
-                    server_paths
-                        .lock()
-                        .expect("paths mutex is not poisoned")
-                        .push(path.clone());
-                    let (status, body) = routes
-                        .get(&path)
-                        .map(|body| ("200 OK", body.as_str()))
-                        .unwrap_or(("404 Not Found", "not found"));
-                    let content_type = if path == "/llms.txt" {
-                        "text/plain"
-                    } else {
-                        "text/html"
-                    };
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                }
-            });
-
-            Self {
-                url,
-                paths,
-                stop,
-                handle: Some(handle),
-            }
-        }
-
-        fn paths(&self) -> Vec<String> {
-            self.paths
-                .lock()
-                .expect("paths mutex is not poisoned")
-                .clone()
-        }
-    }
-
-    impl Drop for TestHttpServer {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(handle) = self.handle.take() {
-                handle.join().expect("test server exits");
-            }
-        }
     }
 }

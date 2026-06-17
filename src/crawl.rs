@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use color_eyre::eyre;
+use futures_util::StreamExt;
 use regex::Regex;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ use url::Url;
 
 use crate::cache::{CachedPage, PageCache};
 use crate::config;
+use crate::fs_atomic;
+use crate::http;
 use crate::scrape::{self, Scraper};
 use crate::types::Page;
 
@@ -75,7 +78,7 @@ where
     let deny = compile_deny(&options.deny)?;
     let mut visited = HashSet::new();
     let mut current = VecDeque::new();
-    let cache = Arc::new(Mutex::new(cache.cloned()));
+    let cache = cache.cloned();
     let host_stats = Arc::new(Mutex::new(HashMap::new()));
     let concurrency = options.concurrency.max(1);
 
@@ -110,42 +113,41 @@ where
     let mut results = Vec::new();
     while !current.is_empty() {
         let mut next = VecDeque::new();
-        let mut running = tokio::task::JoinSet::new();
 
-        loop {
-            while running.len() < concurrency {
-                let Some(item) = current.pop_front() else {
-                    break;
-                };
-                let scraper = scraper.clone();
-                let cache = Arc::clone(&cache);
-                let host_stats = Arc::clone(&host_stats);
-                let max_depth = options.depth;
-                running.spawn(async move {
-                    process_item(item, scraper, cache, host_stats, max_depth).await
-                });
-            }
+        {
+            let workers = futures_util::stream::iter(current.drain(..))
+                .map(|item| {
+                    let scraper = scraper.clone();
+                    let cache = cache.clone();
+                    let host_stats = Arc::clone(&host_stats);
+                    let max_depth = options.depth;
 
-            let Some(joined) = running.join_next().await else {
-                break;
-            };
-            let processed = joined.map_err(|err| eyre::eyre!("crawl worker failed: {err}"))?;
-            for link in processed.links {
-                enqueue(
-                    &mut next,
-                    &mut visited,
-                    scraper,
-                    &link,
-                    processed.depth + 1,
-                    "link",
-                    &seed_host,
-                    &options.allow,
-                    &deny,
-                );
-            }
-            if let Some(result) = processed.result {
-                on_result(&result);
-                results.push(result);
+                    tokio::spawn(async move {
+                        process_item(item, scraper, cache, host_stats, max_depth).await
+                    })
+                })
+                .buffer_unordered(concurrency);
+            futures_util::pin_mut!(workers);
+
+            while let Some(joined) = workers.next().await {
+                let processed = joined.map_err(|err| eyre::eyre!("crawl worker failed: {err}"))?;
+                for link in processed.links {
+                    enqueue(
+                        &mut next,
+                        &mut visited,
+                        scraper,
+                        &link,
+                        processed.depth + 1,
+                        "link",
+                        &seed_host,
+                        &options.allow,
+                        &deny,
+                    );
+                }
+                if let Some(result) = processed.result {
+                    on_result(&result);
+                    results.push(result);
+                }
             }
         }
 
@@ -165,16 +167,13 @@ struct ProcessedItem {
 async fn process_item(
     item: QueueItem,
     scraper: Scraper,
-    cache: Arc<Mutex<Option<PageCache>>>,
+    cache: Option<PageCache>,
     host_stats: SharedHostJsStats,
     max_depth: usize,
 ) -> ProcessedItem {
-    let cached = {
-        let cache = cache.lock().expect("cache mutex is not poisoned");
-        cache
-            .as_ref()
-            .and_then(|cache| cache.get_any(&item.fetch_url))
-    };
+    let cached = cache
+        .as_ref()
+        .and_then(|cache| cache.get_any(&item.fetch_url));
     if let Some(cached) = cached.as_ref()
         && !cached.expired
         && !scrape::cache_stale_for_browser(&cached.source, scraper.has_browser())
@@ -223,7 +222,6 @@ async fn process_item(
         Ok(fetch) => {
             if fetch.not_modified {
                 if let Some(cached) = cached {
-                    let cache = cache.lock().expect("cache mutex is not poisoned");
                     if let Some(cache) = cache.as_ref() {
                         cache.put(&item.fetch_url, &cached.page, &cached.source);
                     }
@@ -249,11 +247,8 @@ async fn process_item(
             }
 
             let page = page_with_crawl_urls(fetch.page, &item.url, &item.fetch_url);
-            {
-                let cache = cache.lock().expect("cache mutex is not poisoned");
-                if let Some(cache) = cache.as_ref() {
-                    cache.put(&item.fetch_url, &page, &fetch.source);
-                }
+            if let Some(cache) = cache.as_ref() {
+                cache.put(&item.fetch_url, &page, &fetch.source);
             }
 
             let links = if item.depth < max_depth {
@@ -462,10 +457,7 @@ pub fn extract_links(page_url: &str, html: &str) -> Vec<String> {
 }
 
 pub async fn fetch_sitemap(sitemap_url: &str) -> eyre::Result<Vec<String>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (compatible; snarf/1.0)")
-        .build()?;
+    let client = http::client(http::FETCH_TIMEOUT)?;
     let body = client
         .get(sitemap_url)
         .send()
@@ -563,15 +555,9 @@ pub fn status_path(id: &str) -> eyre::Result<PathBuf> {
 
 pub fn write_status(status: &mut CrawlStatus) -> eyre::Result<()> {
     let path = status_path(&status.id)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     status.updated_at = Utc::now();
     let data = serde_json::to_string_pretty(status)?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, format!("{data}\n"))?;
-    fs::rename(tmp_path, path)?;
-    Ok(())
+    fs_atomic::write(path, format!("{data}\n"))
 }
 
 pub fn read_status(id: &str) -> eyre::Result<CrawlStatus> {
@@ -606,18 +592,15 @@ pub fn list_statuses() -> eyre::Result<Vec<CrawlStatus>> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use regex::Regex;
 
     use crate::cache::PageCache;
     use crate::scrape::{SOURCE_HTTP, Scraper};
+    use crate::testserver::TestHttpServer;
     use crate::types::Page;
     use crate::urlrewrite::{Rewriter, Rule};
 
@@ -742,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetches_urlset_sitemaps() {
-        let server = TestHttpServer::new(HashMap::from([(
+        let server = TestHttpServer::routes_with_root_fallback(HashMap::from([(
             "/sitemap.xml".to_string(),
             r#"
             <urlset>
@@ -770,7 +753,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetches_sitemap_indexes() {
-        let server = TestHttpServer::new(HashMap::from([
+        let server = TestHttpServer::routes_with_root_fallback(HashMap::from([
             (
                 "/sitemap.xml".to_string(),
                 r#"<sitemapindex><sitemap><loc>SERVER/sitemap-pages.xml</loc></sitemap></sitemapindex>"#.to_string(),
@@ -803,7 +786,7 @@ mod tests {
             body.push_str("</article></main></body></html>");
             routes.insert(path.to_string(), body);
         }
-        let server = TestHttpServer::new(routes);
+        let server = TestHttpServer::routes_with_root_fallback(routes);
         let scraper = Scraper::new(String::new(), None).unwrap();
         let mut callback_urls = Vec::new();
 
@@ -838,7 +821,7 @@ mod tests {
 
     #[tokio::test]
     async fn crawl_host_rewrite_preserves_original_url_and_records_fetched_url() {
-        let server = TestHttpServer::new(HashMap::from([(
+        let server = TestHttpServer::routes_with_root_fallback(HashMap::from([(
             "/start".to_string(),
             format!(
                 "<!doctype html><html><head><title>Rewritten</title></head><body><main><p>{}</p></main></body></html>",
@@ -880,7 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_cache_refetch_reports_changed_content() {
-        let server = TestHttpServer::new(HashMap::from([(
+        let server = TestHttpServer::routes_with_root_fallback(HashMap::from([(
             "/".to_string(),
             "<!doctype html><html><head><title>New</title></head><body><main><p>new crawled content with enough words for extraction to keep this page body</p></main></body></html>".to_string(),
         )]));
@@ -963,85 +946,5 @@ mod tests {
             .join("crawl-tests")
             .join(format!("{name}-{}.json", std::process::id()));
         PageCache::for_path(path, ttl)
-    }
-
-    struct TestHttpServer {
-        url: String,
-        routes: Arc<Mutex<HashMap<String, String>>>,
-        stop: Arc<AtomicBool>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl TestHttpServer {
-        fn new(routes: HashMap<String, String>) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("test server binds");
-            listener
-                .set_nonblocking(true)
-                .expect("test server can be nonblocking");
-            let url = format!("http://{}", listener.local_addr().expect("server has addr"));
-            let routes = Arc::new(Mutex::new(routes));
-            let server_routes = Arc::clone(&routes);
-            let stop = Arc::new(AtomicBool::new(false));
-            let server_stop = Arc::clone(&stop);
-
-            let handle = thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-                    let Ok((mut stream, _)) = listener.accept() else {
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    };
-                    stream
-                        .set_nonblocking(false)
-                        .expect("test connection can be blocking");
-                    let routes = Arc::clone(&server_routes);
-                    thread::spawn(move || {
-                        let mut request = [0u8; 4096];
-                        let n = stream.read(&mut request).unwrap_or_default();
-                        let request = String::from_utf8_lossy(&request[..n]);
-                        let path = request
-                            .lines()
-                            .next()
-                            .and_then(|line| line.split_whitespace().nth(1))
-                            .unwrap_or("/");
-                        let routes = routes.lock().expect("routes mutex is not poisoned");
-                        let (status, body) = routes
-                            .get(path)
-                            .or_else(|| routes.get("/"))
-                            .map(|body| ("200 OK", body.as_str()))
-                            .unwrap_or(("404 Not Found", "not found"));
-                        let _ = write!(
-                            stream,
-                            "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                    });
-                }
-            });
-
-            Self {
-                url,
-                routes,
-                stop,
-                handle: Some(handle),
-            }
-        }
-
-        fn replace_route_token(&self, token: &str) {
-            let mut routes = self.routes.lock().expect("routes mutex is not poisoned");
-            for body in routes.values_mut() {
-                *body = body.replace(token, &self.url);
-            }
-        }
-    }
-
-    impl Drop for TestHttpServer {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(handle) = self.handle.take() {
-                handle.join().expect("test server exits");
-            }
-        }
     }
 }

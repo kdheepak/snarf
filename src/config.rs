@@ -1,19 +1,92 @@
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clap::ValueEnum;
 use color_eyre::eyre;
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::fs_atomic;
 use crate::urlrewrite::Rule;
 
+macro_rules! backend_enum {
+    (
+        $vis:vis enum $name:ident {
+            $($variant:ident => $value:literal),+ $(,)?
+        }
+    ) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+        $vis enum $name {
+            $(
+                #[serde(rename = $value)]
+                #[value(name = $value)]
+                $variant,
+            )+
+        }
+
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value,)+
+                }
+            }
+
+            pub fn parse(value: &str) -> Result<Self, String> {
+                <Self as ValueEnum>::from_str(value, true).map_err(|_| {
+                    format!(
+                        "invalid value {value:?} (valid: {})",
+                        Self::values().join(", ")
+                    )
+                })
+            }
+
+            pub fn values() -> Vec<&'static str> {
+                Self::value_variants()
+                    .iter()
+                    .map(|backend| backend.as_str())
+                    .collect()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+backend_enum! {
+    pub enum SearchBackend {
+        Brave => "brave",
+        Ddg => "ddg",
+        Searxng => "searxng",
+        Exa => "exa",
+    }
+}
+
+backend_enum! {
+    pub enum CodeBackend {
+        Grepapp => "grepapp",
+        Sourcegraph => "sourcegraph",
+        Github => "github",
+    }
+}
+
+backend_enum! {
+    pub enum DocsBackend {
+        Context7 => "context7",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
-    pub backend: String,
+    pub backend: SearchBackend,
     pub searxng_url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub brave_api_key: String,
@@ -23,13 +96,10 @@ pub struct AppConfig {
     pub cache_ttl: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub browser: String,
-    #[serde(default)]
-    pub code_backend: String,
-    #[serde(default)]
-    pub docs_backend: String,
+    pub code_backend: CodeBackend,
+    pub docs_backend: DocsBackend,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub context7_api_key: String,
-    #[serde(default)]
     pub sourcegraph_url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub github_token: String,
@@ -40,15 +110,15 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            backend: "ddg".to_string(),
+            backend: SearchBackend::Ddg,
             searxng_url: "http://localhost:8081".to_string(),
             brave_api_key: String::new(),
             exa_api_key: String::new(),
             limit: 5,
             cache_ttl: "72h".to_string(),
             browser: String::new(),
-            code_backend: "grepapp".to_string(),
-            docs_backend: "context7".to_string(),
+            code_backend: CodeBackend::Grepapp,
+            docs_backend: DocsBackend::Context7,
             context7_api_key: String::new(),
             sourcegraph_url: "https://sourcegraph.com".to_string(),
             github_token: String::new(),
@@ -69,14 +139,7 @@ impl AppConfig {
             Err(_) => return Self::default(),
         };
 
-        let mut config = Self::default();
-        match serde_json::from_str::<serde_json::Value>(&data) {
-            Ok(value) => {
-                merge_config_value(&mut config, value);
-                config
-            }
-            Err(_) => Self::default(),
-        }
+        serde_json::from_str(&data).unwrap_or_default()
     }
 
     pub fn save(&self) -> eyre::Result<()> {
@@ -85,7 +148,7 @@ impl AppConfig {
             fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(self)?;
-        write_file_atomic(&path, &format!("{data}\n"))?;
+        fs_atomic::write(&path, format!("{data}\n"))?;
         Ok(())
     }
 
@@ -143,79 +206,6 @@ fn github_token_from_gh(command: impl AsRef<std::ffi::OsStr>, timeout: Duration)
     }
 }
 
-fn merge_config_value(config: &mut AppConfig, value: serde_json::Value) {
-    let object = match value.as_object() {
-        Some(object) => object,
-        None => return,
-    };
-
-    if let Some(value) = object.get("backend").and_then(serde_json::Value::as_str) {
-        config.backend = value.to_string();
-    }
-    if let Some(value) = object
-        .get("searxng_url")
-        .and_then(serde_json::Value::as_str)
-    {
-        config.searxng_url = value.to_string();
-    }
-    if let Some(value) = object
-        .get("brave_api_key")
-        .and_then(serde_json::Value::as_str)
-    {
-        config.brave_api_key = value.to_string();
-    }
-    if let Some(value) = object
-        .get("exa_api_key")
-        .and_then(serde_json::Value::as_str)
-    {
-        config.exa_api_key = value.to_string();
-    }
-    if let Some(value) = object.get("limit").and_then(serde_json::Value::as_u64) {
-        config.limit = value as usize;
-    }
-    if let Some(value) = object.get("cache_ttl").and_then(serde_json::Value::as_str) {
-        config.cache_ttl = value.to_string();
-    }
-    if let Some(value) = object.get("browser").and_then(serde_json::Value::as_str) {
-        config.browser = value.to_string();
-    }
-    if let Some(value) = object
-        .get("code_backend")
-        .and_then(serde_json::Value::as_str)
-    {
-        config.code_backend = value.to_string();
-    }
-    if let Some(value) = object
-        .get("docs_backend")
-        .and_then(serde_json::Value::as_str)
-    {
-        config.docs_backend = value.to_string();
-    }
-    if let Some(value) = object
-        .get("context7_api_key")
-        .and_then(serde_json::Value::as_str)
-    {
-        config.context7_api_key = value.to_string();
-    }
-    if let Some(value) = object
-        .get("sourcegraph_url")
-        .and_then(serde_json::Value::as_str)
-    {
-        config.sourcegraph_url = value.to_string();
-    }
-    if let Some(value) = object
-        .get("github_token")
-        .and_then(serde_json::Value::as_str)
-    {
-        config.github_token = value.to_string();
-    }
-    if let Some(value) = object.get("url_rewrites")
-        && let Ok(rules) = serde_json::from_value::<Vec<Rule>>(value.clone())
-    {
-        config.url_rewrites = rules;
-    }
-}
-
 pub fn config_path() -> eyre::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(dir).join("snarf").join("config.json"));
@@ -236,26 +226,16 @@ pub fn cache_dir() -> eyre::Result<PathBuf> {
     Ok(dir)
 }
 
-fn write_file_atomic(path: &Path, contents: &str) -> eyre::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, contents)?;
-    fs::rename(tmp_path, path)?;
-    Ok(())
+pub fn available_backends() -> Vec<&'static str> {
+    SearchBackend::values()
 }
 
-pub fn available_backends() -> [&'static str; 4] {
-    ["brave", "ddg", "searxng", "exa"]
+pub fn available_code_backends() -> Vec<&'static str> {
+    CodeBackend::values()
 }
 
-pub fn available_code_backends() -> [&'static str; 3] {
-    ["grepapp", "sourcegraph", "github"]
-}
-
-pub fn available_doc_backends() -> [&'static str; 2] {
-    ["context7", "local"]
+pub fn available_doc_backends() -> Vec<&'static str> {
+    DocsBackend::values()
 }
 
 pub fn parse_duration(value: &str) -> eyre::Result<Duration> {
@@ -343,7 +323,9 @@ mod tests {
 
     use crate::urlrewrite::Rule;
 
-    use super::{AppConfig, github_token_from_gh, parse_duration, write_file_atomic};
+    use super::{
+        AppConfig, CodeBackend, DocsBackend, SearchBackend, github_token_from_gh, parse_duration,
+    };
 
     static NEXT_CONFIG_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -419,12 +401,32 @@ mod tests {
 
     #[test]
     fn defaults_to_ddg_search() {
-        assert_eq!(super::AppConfig::default().backend, "ddg");
+        assert_eq!(super::AppConfig::default().backend, SearchBackend::Ddg);
     }
 
     #[test]
     fn defaults_to_empty_url_rewrites() {
         assert!(AppConfig::default().url_rewrites.is_empty());
+    }
+
+    #[test]
+    fn config_json_uses_defaults_for_missing_fields() {
+        let decoded: AppConfig = serde_json::from_str(r#"{"backend":"searxng"}"#).unwrap();
+
+        assert_eq!(decoded.backend, SearchBackend::Searxng);
+        assert_eq!(decoded.searxng_url, "http://localhost:8081");
+        assert_eq!(decoded.limit, 5);
+        assert_eq!(decoded.cache_ttl, "72h");
+        assert_eq!(decoded.code_backend, CodeBackend::Grepapp);
+        assert_eq!(decoded.docs_backend, DocsBackend::Context7);
+        assert_eq!(decoded.sourcegraph_url, "https://sourcegraph.com");
+    }
+
+    #[test]
+    fn config_json_rejects_wrong_field_types() {
+        let decoded = serde_json::from_str::<AppConfig>(r#"{"limit":"5"}"#);
+
+        assert!(decoded.is_err());
     }
 
     #[test]
@@ -455,21 +457,5 @@ mod tests {
     fn config_json_omits_empty_url_rewrites() {
         let data = serde_json::to_string(&AppConfig::default()).unwrap();
         assert!(!data.contains("url_rewrites"));
-    }
-
-    #[test]
-    fn atomic_write_replaces_file_and_removes_temp_file() {
-        let id = NEXT_CONFIG_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("config-tests")
-            .join(format!("atomic-{}-{id}", std::process::id()));
-        let path = root.join("config.json");
-
-        write_file_atomic(&path, "first\n").expect("first write succeeds");
-        write_file_atomic(&path, "second\n").expect("second write succeeds");
-
-        assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
-        assert!(!path.with_extension("json.tmp").exists());
     }
 }

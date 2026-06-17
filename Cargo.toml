@@ -16,6 +16,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 color-eyre = "0.6.5"
 directories = "6.0.0"
 fs2 = "0.4.3"
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 hex = "0.4.3"
 html2md = "0.2.15"
 quick-xml = { version = "0.40.1", features = ["serialize"] }
