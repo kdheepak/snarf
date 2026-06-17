@@ -41,12 +41,6 @@ Create a config file:
 snarf config init
 ```
 
-Show the effective config and available backends:
-
-```sh
-snarf config --json
-```
-
 Set common options:
 
 ```sh
