@@ -5,7 +5,6 @@ mod crawl;
 mod docs;
 mod error;
 mod extract;
-mod fs_atomic;
 mod headers;
 mod http;
 mod scrape;

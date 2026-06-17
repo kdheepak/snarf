@@ -8,7 +8,6 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::config;
-use crate::fs_atomic;
 use crate::http;
 
 const CHECK_TTL_HOURS: i64 = 24;
@@ -212,7 +211,7 @@ fn save_state(state: &CacheState) -> eyre::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs_atomic::write(&path, format!("{}\n", serde_json::to_string_pretty(state)?))?;
+    fs::write(&path, format!("{}\n", serde_json::to_string_pretty(state)?))?;
     Ok(())
 }
 

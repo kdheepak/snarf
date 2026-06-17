@@ -10,7 +10,6 @@ use color_eyre::eyre;
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::fs_atomic;
 use crate::urlrewrite::Rule;
 
 macro_rules! backend_enum {
@@ -148,7 +147,7 @@ impl AppConfig {
             fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(self)?;
-        fs_atomic::write(&path, format!("{data}\n"))?;
+        fs::write(&path, format!("{data}\n"))?;
         Ok(())
     }
 

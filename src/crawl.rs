@@ -13,7 +13,6 @@ use url::Url;
 
 use crate::cache::{CachedPage, PageCache};
 use crate::config;
-use crate::fs_atomic;
 use crate::http;
 use crate::scrape::{self, Scraper};
 use crate::types::Page;
@@ -555,9 +554,14 @@ pub fn status_path(id: &str) -> eyre::Result<PathBuf> {
 
 pub fn write_status(status: &mut CrawlStatus) -> eyre::Result<()> {
     let path = status_path(&status.id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     status.updated_at = Utc::now();
     let data = serde_json::to_string_pretty(status)?;
-    fs_atomic::write(path, format!("{data}\n"))
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, format!("{data}\n"))?;
+    Ok(fs::rename(tmp_path, path)?)
 }
 
 pub fn read_status(id: &str) -> eyre::Result<CrawlStatus> {
