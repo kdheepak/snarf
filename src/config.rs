@@ -300,15 +300,21 @@ fn duration_unit_seconds(unit: &str) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use crate::urlrewrite::Rule;
 
-    use super::{AppConfig, CodeBackend, SearchBackend, github_token_from_gh, parse_duration};
+    #[cfg(unix)]
+    use super::github_token_from_gh;
+    use super::{AppConfig, CodeBackend, SearchBackend, parse_duration};
 
+    #[cfg(unix)]
     static NEXT_CONFIG_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
