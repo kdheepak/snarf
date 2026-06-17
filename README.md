@@ -18,7 +18,6 @@ Scrape a page to markdown:
 
 ```sh
 snarf scrape https://example.com
-snarf scrape https://example.com --select main
 ```
 
 Search code:
