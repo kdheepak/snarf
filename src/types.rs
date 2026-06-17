@@ -28,33 +28,6 @@ pub struct CodeResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DocsResult {
-    pub library: String,
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    pub version: String,
-    pub title: String,
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    pub breadcrumb: String,
-    pub snippet: String,
-    pub url: String,
-    pub source: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LibraryMatch {
-    pub id: String,
-    pub title: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(rename = "totalSnippets", default)]
-    pub total_snippets: usize,
-    #[serde(rename = "trustScore", default)]
-    pub trust_score: f64,
-    #[serde(default)]
-    pub versions: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Page {
     pub url: String,
     #[serde(skip_serializing_if = "String::is_empty", default)]
