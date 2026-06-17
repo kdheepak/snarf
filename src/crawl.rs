@@ -268,7 +268,7 @@ async fn process_item(
                     ..CrawlResult::default()
                 }),
             }
-        }
+        },
         Err(err) => ProcessedItem {
             depth: item.depth,
             links: Vec::new(),
@@ -457,45 +457,164 @@ pub fn extract_links(page_url: &str, html: &str) -> Vec<String> {
 
 pub async fn fetch_sitemap(sitemap_url: &str) -> eyre::Result<Vec<String>> {
     let client = http::client(http::FETCH_TIMEOUT)?;
-    let body = client
-        .get(sitemap_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    parse_sitemap(&body, &client).await
+    let candidates = sitemap_candidates(sitemap_url, &client).await?;
+    let mut failures = Vec::new();
+
+    for candidate in &candidates {
+        let body = match client.get(candidate).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match response.text().await {
+                    Ok(body) => body,
+                    Err(err) => {
+                        failures.push(format!("{candidate}: failed to read response body: {err}"));
+                        continue;
+                    },
+                },
+                Err(err) => {
+                    failures.push(format!("{candidate}: {err}"));
+                    continue;
+                },
+            },
+            Err(err) => {
+                failures.push(format!("{candidate}: {err}"));
+                continue;
+            },
+        };
+
+        match parse_sitemap(&body, &client).await {
+            Ok(urls) => return Ok(urls),
+            Err(err) => failures.push(format!("{candidate}: {err}")),
+        }
+    }
+
+    let tried = candidates.join(", ");
+    let detail = failures
+        .last()
+        .map(|failure| format!("; last error: {failure}"))
+        .unwrap_or_default();
+    eyre::bail!("failed to find a sitemap for {sitemap_url}; tried {tried}{detail}")
+}
+
+async fn sitemap_candidates(
+    sitemap_url: &str,
+    client: &reqwest::Client,
+) -> eyre::Result<Vec<String>> {
+    let seed = Url::parse(sitemap_url).map_err(|err| eyre::eyre!("invalid sitemap URL: {err}"))?;
+    let mut candidates = Vec::new();
+
+    if seed.path() != "/" {
+        push_unique(&mut candidates, seed.to_string());
+    }
+
+    for sitemap in fetch_robots_sitemaps(&seed, client).await {
+        push_unique(&mut candidates, sitemap);
+    }
+
+    for path in ["/sitemap.xml", "/sitemap-index.xml", "/sitemap_index.xml"] {
+        if let Ok(candidate) = seed.join(path) {
+            push_unique(&mut candidates, candidate.to_string());
+        }
+    }
+
+    push_unique(&mut candidates, seed.to_string());
+    Ok(candidates)
+}
+
+async fn fetch_robots_sitemaps(seed: &Url, client: &reqwest::Client) -> Vec<String> {
+    let Ok(robots_url) = seed.join("/robots.txt") else {
+        return Vec::new();
+    };
+    let Ok(response) = client.get(robots_url).send().await else {
+        return Vec::new();
+    };
+    let Ok(response) = response.error_for_status() else {
+        return Vec::new();
+    };
+    let Ok(body) = response.text().await else {
+        return Vec::new();
+    };
+    parse_robots_sitemaps(&body)
+}
+
+fn parse_robots_sitemaps(robots: &str) -> Vec<String> {
+    robots
+        .lines()
+        .filter_map(|line| {
+            let line = line.split_once('#').map_or(line, |(value, _)| value).trim();
+            let (field, value) = line.split_once(':')?;
+            if !field.trim().eq_ignore_ascii_case("sitemap") {
+                return None;
+            }
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        })
+        .collect()
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
 }
 
 async fn parse_sitemap(xml: &str, client: &reqwest::Client) -> eyre::Result<Vec<String>> {
-    if let Ok(index) = quick_xml::de::from_str::<SitemapIndex>(xml)
-        && !index.sitemaps.is_empty()
-    {
-        let mut urls = Vec::new();
-        for sitemap in index.sitemaps {
-            let Ok(response) = client.get(&sitemap.loc).send().await else {
-                continue;
-            };
-            let Ok(body) = response.error_for_status()?.text().await else {
-                continue;
-            };
-            if let Ok(mut child_urls) = Box::pin(parse_sitemap(&body, client)).await {
-                urls.append(&mut child_urls);
+    match first_xml_element(xml)? {
+        Some(root) if root == "sitemapindex" => {
+            let index: SitemapIndex = quick_xml::de::from_str(xml)
+                .map_err(|err| eyre::eyre!("failed to parse sitemap XML: {err}"))?;
+            let mut urls = Vec::new();
+            for sitemap in index.sitemaps {
+                let Ok(response) = client.get(&sitemap.loc).send().await else {
+                    continue;
+                };
+                let Ok(body) = response.error_for_status()?.text().await else {
+                    continue;
+                };
+                if let Ok(mut child_urls) = Box::pin(parse_sitemap(&body, client)).await {
+                    urls.append(&mut child_urls);
+                }
             }
-        }
-        return Ok(urls);
+            Ok(urls)
+        },
+        Some(root) if root == "urlset" => {
+            let url_set: UrlSet = quick_xml::de::from_str(xml)
+                .map_err(|err| eyre::eyre!("failed to parse sitemap XML: {err}"))?;
+            Ok(url_set
+                .urls
+                .into_iter()
+                .filter_map(|entry| {
+                    let loc = entry.loc.trim().to_string();
+                    if loc.is_empty() { None } else { Some(loc) }
+                })
+                .collect())
+        },
+        Some(root) => {
+            eyre::bail!("expected sitemap XML root <urlset> or <sitemapindex>, found <{root}>")
+        },
+        None => eyre::bail!("empty sitemap XML document"),
     }
+}
 
-    let url_set: UrlSet = quick_xml::de::from_str(xml)
-        .map_err(|err| eyre::eyre!("failed to parse sitemap XML: {err}"))?;
-    Ok(url_set
-        .urls
-        .into_iter()
-        .filter_map(|entry| {
-            let loc = entry.loc.trim().to_string();
-            if loc.is_empty() { None } else { Some(loc) }
-        })
-        .collect())
+fn first_xml_element(xml: &str) -> eyre::Result<Option<String>> {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(element))
+            | Ok(quick_xml::events::Event::Empty(element)) => {
+                let name = element.name();
+                return Ok(Some(String::from_utf8_lossy(name.as_ref()).into_owned()));
+            },
+            Ok(quick_xml::events::Event::Eof) => return Ok(None),
+            Ok(_) => {},
+            Err(err) => return Err(eyre::eyre!("failed to parse sitemap XML: {err}")),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
