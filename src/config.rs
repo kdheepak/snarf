@@ -180,7 +180,7 @@ fn github_token_from_gh(command: impl AsRef<std::ffi::OsStr>, timeout: Duration)
                 child.stdout.take()?.read_to_string(&mut stdout).ok()?;
                 let token = stdout.trim().to_string();
                 return if token.is_empty() { None } else { Some(token) };
-            }
+            },
             Ok(None) => {
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
@@ -188,7 +188,7 @@ fn github_token_from_gh(command: impl AsRef<std::ffi::OsStr>, timeout: Duration)
                     return None;
                 }
                 thread::sleep(Duration::from_millis(20));
-            }
+            },
             Err(_) => return None,
         }
     }
