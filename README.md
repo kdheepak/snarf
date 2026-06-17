@@ -2,9 +2,6 @@
 
 Fast CLI for search, scraping, code search, and site crawling.
 
-`snarf` is built for CLI workflows: it returns text by default, supports JSON output with `--json`,
-caches scraped pages, and can use a browser when plain HTTP fetches are not enough.
-
 ## Examples
 
 Search the web:
