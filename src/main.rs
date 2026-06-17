@@ -329,7 +329,7 @@ async fn main() -> ExitCode {
         Err(error) => {
             eprintln!("error: {}", error.message);
             ExitCode::from(error.code)
-        },
+        }
     }
 }
 
@@ -414,7 +414,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         None => {
             print_root(&cfg);
             Ok(())
-        },
+        }
     };
     if result.is_ok() {
         emit_passive_update_notice(passive_update);
@@ -590,7 +590,7 @@ async fn run_search_scrape(
                     result.fetched_url = page.fetched_url.clone();
                     page.markdown = extract::post_process(&page.markdown, trim, max_chars);
                     result.content = page.markdown;
-                },
+                }
                 Err(err) => eprintln!("warn: failed to scrape {}: {err}", result.url),
             }
         }
@@ -614,7 +614,7 @@ async fn run_search_scrape(
                     }
                     print_page(&page);
                 }
-            },
+            }
             Err(err) => eprintln!("warn: failed to scrape {}: {err}", result.url),
         }
     }
@@ -932,8 +932,8 @@ async fn run_crawl(as_json: bool, cfg: &AppConfig, args: CrawlArgs) -> Result<()
                 .map_err(|err| CliError::upstream(format!("failed to stop crawl: {err}")))?;
             eprintln!("Sent stop signal to crawl {id} (pid {})", status.pid);
             return Ok(());
-        },
-        None => {},
+        }
+        None => {}
     }
 
     let seed = args
@@ -978,7 +978,7 @@ async fn run_crawl(as_json: bool, cfg: &AppConfig, args: CrawlArgs) -> Result<()
                     "new" => new_count += 1,
                     "changed" => changed += 1,
                     "unchanged" => unchanged += 1,
-                    _ => {},
+                    _ => {}
                 }
                 if let Some(page) = &result.page {
                     if as_json {
@@ -1020,7 +1020,7 @@ async fn run_crawl(as_json: bool, cfg: &AppConfig, args: CrawlArgs) -> Result<()
         CrawlOutcome::Finished(result) => {
             result.map_err(|err| CliError::upstream(format!("crawl failed: {err}")))?;
             None
-        },
+        }
         CrawlOutcome::Cancelled(signal) => Some(signal),
     };
     print_crawl_summary(
@@ -1090,14 +1090,14 @@ fn run_crawl_background(seed: &str) -> Result<(), CliError> {
         .stderr(Stdio::from(dev_null))
         .spawn()
     {
-        Ok(_child) => {},
+        Ok(_child) => {}
         Err(err) => {
             mark_crawl_status_failed(&mut status, err.to_string());
             let _ = crawl::write_status(&mut status);
             return Err(CliError::upstream(format!(
                 "failed to start background crawl: {err}"
             )));
-        },
+        }
     }
     println!("crawl_id: {}", status.id);
     eprintln!(
@@ -1157,7 +1157,7 @@ async fn run_crawl_worker(
                             "new" => status.new += 1,
                             "changed" => status.changed += 1,
                             "unchanged" => status.unchanged += 1,
-                            _ => {},
+                            _ => {}
                         }
                     }
                     if status.pages.is_multiple_of(10)
@@ -1187,18 +1187,18 @@ async fn run_crawl_worker(
             status.status = "completed".to_string();
             crawl::write_status(&mut status).map_err(|err| CliError::upstream(err.to_string()))?;
             Ok(())
-        },
+        }
         CrawlOutcome::Finished(Err(err)) => {
             mark_crawl_status_failed(&mut status, err.message.clone());
             let _ = crawl::write_status(&mut status);
             Err(err)
-        },
+        }
         CrawlOutcome::Cancelled(_) => {
             status.status = "stopped".to_string();
             status.error.clear();
             crawl::write_status(&mut status).map_err(|err| CliError::upstream(err.to_string()))?;
             Ok(())
-        },
+        }
     }
 }
 
@@ -1303,7 +1303,7 @@ async fn run_browser(as_json: bool, cfg: &AppConfig, args: BrowserArgs) -> Resul
                 eprintln!("Configure with: snarf config set browser {path}");
             }
             Ok(())
-        },
+        }
         Some(BrowserCommand::Status) => {
             if cfg.browser.is_empty() {
                 if as_json {
@@ -1329,7 +1329,7 @@ async fn run_browser(as_json: bool, cfg: &AppConfig, args: BrowserArgs) -> Resul
                             println!("browser_path: {path}");
                             println!("status: ok");
                         }
-                    },
+                    }
                     Err(err) => {
                         if as_json {
                             print_json(&serde_json::json!({
@@ -1341,15 +1341,15 @@ async fn run_browser(as_json: bool, cfg: &AppConfig, args: BrowserArgs) -> Resul
                             println!("browser_config: {}", cfg.browser);
                             println!("status: error ({err})");
                         }
-                    },
+                    }
                 }
             }
             Ok(())
-        },
+        }
         None => {
             print_browser_help();
             Ok(())
-        },
+        }
     }
 }
 
@@ -1388,7 +1388,7 @@ async fn run_config(as_json: bool, cfg: &AppConfig, args: ConfigArgs) -> Result<
             } else {
                 print_json_pretty(&info)?;
             }
-        },
+        }
         Some(ConfigCommand::Init) => {
             let path = config::config_path().map_err(|err| CliError::upstream(err.to_string()))?;
             if path.exists() {
@@ -1408,7 +1408,7 @@ async fn run_config(as_json: bool, cfg: &AppConfig, args: ConfigArgs) -> Result<
             } else {
                 eprintln!("created {}", path.display());
             }
-        },
+        }
         Some(ConfigCommand::Set { key, value }) => {
             let mut config = AppConfig::load();
             apply_config_set(&mut config, &key, &value)?;
@@ -1424,7 +1424,7 @@ async fn run_config(as_json: bool, cfg: &AppConfig, args: ConfigArgs) -> Result<
             } else {
                 eprintln!("set {key} = {value}");
             }
-        },
+        }
         Some(ConfigCommand::Path) => {
             let path = config::config_path().map_err(|err| CliError::upstream(err.to_string()))?;
             if as_json {
@@ -1432,7 +1432,7 @@ async fn run_config(as_json: bool, cfg: &AppConfig, args: ConfigArgs) -> Result<
             } else {
                 println!("{}", path.display());
             }
-        },
+        }
     }
     Ok(())
 }
@@ -1441,7 +1441,7 @@ fn apply_config_set(cfg: &mut AppConfig, key: &str, value: &str) -> Result<(), C
     match key {
         "backend" => {
             cfg.backend = SearchBackend::parse(value).map_err(CliError::validation)?;
-        },
+        }
         "searxng_url" => cfg.searxng_url = value.to_string(),
         "brave_api_key" => cfg.brave_api_key = value.to_string(),
         "exa_api_key" => cfg.exa_api_key = value.to_string(),
@@ -1449,7 +1449,7 @@ fn apply_config_set(cfg: &mut AppConfig, key: &str, value: &str) -> Result<(), C
             cfg.limit = value
                 .parse()
                 .map_err(|err| CliError::validation(format!("limit must be an integer: {err}")))?;
-        },
+        }
         "cache_ttl" => {
             config::parse_duration(value).map_err(|err| {
                 CliError::validation(format!(
@@ -1457,11 +1457,11 @@ fn apply_config_set(cfg: &mut AppConfig, key: &str, value: &str) -> Result<(), C
                 ))
             })?;
             cfg.cache_ttl = value.to_string();
-        },
+        }
         "browser" => cfg.browser = value.to_string(),
         "code_backend" => {
             cfg.code_backend = CodeBackend::parse(value).map_err(CliError::validation)?;
-        },
+        }
         "sourcegraph_url" => cfg.sourcegraph_url = value.to_string(),
         "github_token" => cfg.github_token = value.to_string(),
         "url_rewrites" => {
@@ -1473,12 +1473,12 @@ fn apply_config_set(cfg: &mut AppConfig, key: &str, value: &str) -> Result<(), C
             urlrewrite::Rewriter::new(&rules)
                 .map_err(|err| CliError::validation(err.to_string()))?;
             cfg.url_rewrites = rules;
-        },
+        }
         _ => {
             return Err(CliError::validation(format!(
                 "unknown key: {key} (valid: backend, searxng_url, brave_api_key, exa_api_key, limit, cache_ttl, browser, code_backend, sourcegraph_url, github_token, url_rewrites)"
             )));
-        },
+        }
     }
     Ok(())
 }
@@ -1492,7 +1492,7 @@ async fn run_cache(as_json: bool, cfg: &AppConfig, args: CacheArgs) -> Result<()
             } else {
                 eprintln!("cache cleared");
             }
-        },
+        }
         None => {
             let path = cache::db_path().map_err(|err| CliError::upstream(err.to_string()))?;
             let (entries, bytes) =
@@ -1514,7 +1514,7 @@ async fn run_cache(as_json: bool, cfg: &AppConfig, args: CacheArgs) -> Result<()
                 println!("ttl: {}", cfg.cache_ttl);
                 println!("---");
             }
-        },
+        }
     }
     Ok(())
 }
