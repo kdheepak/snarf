@@ -984,7 +984,7 @@ fn background_crawl_stop_preserves_final_counts() {
                         body.len(),
                         body
                     );
-                }
+                },
                 "/slow" => {
                     server_slow_seen.store(true, Ordering::Relaxed);
                     while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
@@ -993,12 +993,12 @@ fn background_crawl_stop_preserves_final_counts() {
                     let _ = stream.write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
                     );
-                }
+                },
                 _ => {
                     let _ = stream.write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     );
-                }
+                },
             }
         }
     });
