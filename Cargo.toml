@@ -19,7 +19,7 @@ fs2 = "0.4.3"
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 hex = "0.4.3"
 html2md = "0.2.15"
-quick-xml = { version = "0.40.1", features = ["serialize"] }
+quick-xml = { version = "0.41.0", features = ["serialize"] }
 rand = "0.10.1"
 regex = "1.12.4"
 reqwest = { version = "0.13.4", features = ["json", "query"] }
