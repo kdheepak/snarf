@@ -1,6 +1,6 @@
 [package]
 name = "snarf"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 default-run = "snarf"
 description = "Fast CLI for web searching."
